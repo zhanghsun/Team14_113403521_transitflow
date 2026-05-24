@@ -133,3 +133,31 @@ TODO — add a prompt here after your schema design workshop
 ```
 TODO — add after implementing your first function
 ```
+
+# TransitFlow 專案開發與資料庫設計規範
+
+## 📌 一、核心設計與商業邏輯 (Business Logic & Core Design)
+
+* **商業邏輯規範**：開發前需完整理解並遵守專案中的 Business Rules。
+* **資料刪除方式**：所有資料皆需採用軟刪除（Soft Delete）機制處理，不可直接將資料從資料庫永久移除。
+* **存取權限管理**：使用者若尚未登入，不得查詢或取得任何訂票相關紀錄。
+* **主鍵設計 (PK)**：可由團隊自行選擇使用 **UUID v7**（建議搭配 `binary(16)` 儲存以降低空間使用）或 **Auto Increment**（自動遞增）。
+* **驗收重點**：主要檢查系統回傳結果是否正確；若問題來自 AI 助理本身能力限制，可不列入扣分考量。
+
+## 🔒 二、資訊安全與帳密管理 (Security & Credential Management)
+
+* **密碼保護規範**：禁止以明碼儲存密碼，且不得使用 MD5 或 SHA 系列作為 Hash 演算法，建議採用 **argon2id**。
+* **帳密分離設計**：密碼資料不可直接存放於 `user` 資料表，應獨立建立如 `user_credentials` 的資料表。
+
+  * **欄位需求**：需包含 `c_id`（代理鍵 / Surrogate Key）、`u_id`（外鍵 / Foreign Key）、hash、salt 等欄位。
+  * **存取限制**：此資料表需設定更嚴格的權限控管，也可考慮拆分至不同 Schema 儲存。
+* **Salt 產生方式**：建議使用 **CSPRNG** 產生安全隨機值，並妥善設定資料庫中的欄位長度。
+* **驗證流程**：Hash 的驗證與比對可在 Web Server 或資料庫端執行。
+* **帳號復原機制**：系統需提供秘密問題（Secret Question）與答案驗證功能，以利帳號救援。
+
+## 📁 三、專案檔案整合與實作細節 (Implementation & Configurations)
+
+* **Schema First 原則**：需先完成資料表設計，並確保 `schema.sql`、`seed_postgres.py` 與 `registered_users.json` 三者之間的欄位與邏輯一致。
+* **向量資料庫設定 (Vector DB)**：`seed_vectors.py` 已預先完成，目前採用「一份文件對應一個向量」的架構，開發時不需修改。
+* **Timeout 設定**：系統預設逾時時間為 300 秒，如有需要可於 `skeleton/config.py` 中自行調整。
+* **彈性擴充區域**：`feedback.json` 尚未定義固定用途，團隊可依需求自由規劃與應用。
