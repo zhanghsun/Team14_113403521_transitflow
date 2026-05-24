@@ -315,7 +315,6 @@ def query_station_connections(station_id: str) -> list[dict]: ...
 
 **Graph Schema:**
 - [ ] Graph schema: TODO — add your node label and relationship type decisions here
-
 - [ ] (example) Metro schedule stop ordering: using `jsonb_array_elements` approach — easier to debug than containment operators
 
 
