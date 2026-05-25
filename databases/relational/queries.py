@@ -318,7 +318,25 @@ def login_user(email: str, password: str) -> Optional[dict]:
 
 def get_user_secret_question(email: str) -> Optional[str]:
     """Return the secret question for a registered email, or None if not found."""
-    raise NotImplementedError("TODO: implement after designing your schema")
+
+    with _connect() as conn:
+        with conn.cursor() as cur:
+
+            cur.execute(
+                """
+                SELECT secret_question
+                FROM users
+                WHERE email = %s
+                """,
+                (email,)
+            )
+
+            row = cur.fetchone()
+
+            if row:
+                return row[0]
+
+            return None
 
 
 def verify_secret_answer(email: str, answer: str) -> bool:
