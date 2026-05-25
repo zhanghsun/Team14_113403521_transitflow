@@ -361,8 +361,21 @@ def verify_secret_answer(email: str, answer: str) -> bool:
 
 
 def update_password(email: str, new_password: str) -> bool:
-    """Update the password for a user. Returns True if the row was updated."""
-    raise NotImplementedError("TODO: implement after designing your schema")
+    """Update the password for a user."""
+
+    with _connect() as conn:
+        with conn.cursor() as cur:
+
+            cur.execute(
+                """
+                UPDATE users
+                SET password = %s
+                WHERE email = %s
+                """,
+                (new_password, email)
+            )
+
+            return cur.rowcount > 0
 
 
 # ── VECTOR / RAG QUERIES — do not modify ─────────────────────────────────────
