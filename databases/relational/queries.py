@@ -293,9 +293,27 @@ def register_user(
 def login_user(email: str, password: str) -> Optional[dict]:
     """
     Verify credentials. Returns a user dict on success or None on failure.
-    Dict keys: user_id, email, full_name, first_name, surname, phone, date_of_birth, is_active.
     """
-    raise NotImplementedError("TODO: implement after designing your schema")
+
+    with _connect() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+
+            cur.execute(
+                """
+                SELECT *
+                FROM users
+                WHERE email = %s
+                AND password = %s
+                """,
+                (email, password)
+            )
+
+            row = cur.fetchone()
+
+            if row:
+                return dict(row)
+
+            return None
 
 
 def get_user_secret_question(email: str) -> Optional[str]:
