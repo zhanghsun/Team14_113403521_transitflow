@@ -340,8 +340,24 @@ def get_user_secret_question(email: str) -> Optional[str]:
 
 
 def verify_secret_answer(email: str, answer: str) -> bool:
-    """Return True if the provided answer matches the stored secret answer (case-insensitive)."""
-    raise NotImplementedError("TODO: implement after designing your schema")
+    """Return True if the provided answer matches the stored secret answer."""
+
+    with _connect() as conn:
+        with conn.cursor() as cur:
+
+            cur.execute(
+                """
+                SELECT 1
+                FROM users
+                WHERE email = %s
+                AND LOWER(secret_answer) = LOWER(%s)
+                """,
+                (email, answer)
+            )
+
+            row = cur.fetchone()
+
+            return row is not None
 
 
 def update_password(email: str, new_password: str) -> bool:
