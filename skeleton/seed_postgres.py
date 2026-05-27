@@ -29,6 +29,40 @@ from skeleton import config as cfg
 ph = PasswordHasher()
 
 
+# ── helper functions ────────────────────────────────────────────────────────
+def split_full_name(full_name):
+    """
+    Split full_name (from JSON) into first_name and last_name.
+    
+    Example:
+        "Alice Tan" → ("Alice", "Tan")
+        "Ben Lim" → ("Ben", "Lim")
+    """
+    if not full_name:
+        return "", ""
+    parts = full_name.strip().split(" ", 1)
+    first_name = parts[0]
+    last_name = parts[1] if len(parts) > 1 else ""
+    return first_name, last_name
+
+
+def hash_secret(value):
+    """
+    Hash sensitive string (password or secret answer) using argon2id.
+    Argon2id embeds salt in MCF format — no separate salt column needed.
+    
+    Args:
+        value: Plain text password or answer
+    
+    Returns:
+        Argon2id hash string (includes algorithm, parameters, and salt)
+    """
+    if value is None:
+        return None
+    return ph.hash(str(value))
+
+
+# ── data loading & connection ───────────────────────────────────────────────
 def load(filename):
     with open(os.path.join(DATA_DIR, filename), encoding="utf-8") as f:
         return json.load(f)
@@ -149,39 +183,45 @@ def seed_seat_layouts(cur):
 
 
 def seed_users(cur):
+    """
+    Seed users from registered_users.json into users + user_credentials tables.
+    
+    IMPORTANT SECURITY NOTES (for KC's queries.py):
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    - Passwords are hashed with argon2id (NOT plaintext, NOT MD5/SHA)
+    - Salt is EMBEDDED in argon2id MCF format — do NOT store separately
+    - To verify a password in queries.py:
+        from argon2 import PasswordHasher
+        ph = PasswordHasher()
+        ph.verify(db_password_hash, user_input_password)
+    - Secret answers are ALSO hashed with argon2id — use same verification
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    """
     data = load("registered_users.json")
     
-    # Insert users
+    # Prepare user records (split full_name into first_name and last_name)
     user_rows = []
-    cred_rows = []
-    
     for user in data:
-        # Split full_name into first_name and last_name
-        full_name = user.get("full_name", "")
-        parts = full_name.split(" ", 1)
-        first_name = parts[0] if len(parts) > 0 else ""
-        last_name = parts[1] if len(parts) > 1 else ""
-        
+        first_name, last_name = split_full_name(user.get("full_name", ""))
         user_rows.append((
             user["user_id"],
             first_name,
             last_name,
-            user["email"],
+            user["email"].lower(),  # Normalize to lowercase for consistent queries
             user.get("phone"),
             user.get("date_of_birth"),
             user.get("registered_at"),
             user.get("is_active", True),
         ))
-        
-        # Hash password and secret answer using argon2
-        password_hash = ph.hash(user["password"])
-        secret_answer_hash = ph.hash(user["secret_answer"])
-        
-        cred_rows.append((
+    
+    # Prepare credentials (hash password and secret answer with argon2id)
+    credential_rows = []
+    for user in data:
+        credential_rows.append((
             user["user_id"],
-            password_hash,
-            user["secret_question"],
-            secret_answer_hash,
+            ph.hash(user["password"]),              # Argon2id: salt embedded in MCF format
+            user.get("secret_question"),
+            hash_secret(user.get("secret_answer")),  # Also hashed with argon2id
         ))
     
     # Insert user records
@@ -198,7 +238,7 @@ def seed_users(cur):
         cur,
         "user_credentials",
         ["user_id", "password_hash", "secret_question", "secret_answer_hash"],
-        cred_rows,
+        credential_rows,
     )
     print(f"  user_credentials: {n_creds} rows")
 
