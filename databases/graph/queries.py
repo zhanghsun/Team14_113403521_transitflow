@@ -25,6 +25,7 @@ from __future__ import annotations
 from typing import Optional
 
 from neo4j import GraphDatabase
+from neo4j.exceptions import Neo4jError, ServiceUnavailable, SessionExpired
 
 from skeleton.config import NEO4J_URI, NEO4J_USER, NEO4J_PASSWORD
 
@@ -32,6 +33,212 @@ from skeleton.config import NEO4J_URI, NEO4J_USER, NEO4J_PASSWORD
 def _driver():
     """Return a Neo4j driver. Caller is responsible for closing."""
     return GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
+
+
+_HAS_GENERIC_STATION_LABEL: Optional[bool] = None
+_REL_WEIGHT_CAPABILITY_CACHE: dict[str, bool] = {}
+
+
+def _load_station_label_support(session) -> None:
+    """Probe once per process whether the graph has a generic :Station label."""
+    global _HAS_GENERIC_STATION_LABEL
+    if _HAS_GENERIC_STATION_LABEL is not None:
+        return
+    try:
+        rec = session.run(
+            """
+            CALL db.labels() YIELD label
+            RETURN any(x IN collect(label) WHERE x = 'Station') AS has_station
+            """
+        ).single()
+        _HAS_GENERIC_STATION_LABEL = bool(rec and rec["has_station"])
+    except Neo4jError:
+        _HAS_GENERIC_STATION_LABEL = False
+
+
+def _station_labels_filter(alias: str) -> str:
+    """Reusable node-label filter for station lookups (supports optional generic :Station)."""
+    if _HAS_GENERIC_STATION_LABEL:
+        return f"({alias}:Station OR {alias}:MetroStation OR {alias}:NationalRailStation)"
+    return f"({alias}:MetroStation OR {alias}:NationalRailStation)"
+
+
+def _status_open_expr(alias: str) -> str:
+    """Dynamic property access avoids Neo4j key-existence warnings."""
+    return f"coalesce(properties({alias})['status'], 'open')"
+
+
+def _not_closed_expr(alias: str) -> str:
+    """Reusable disruption-aware filter expression."""
+    return f"{_status_open_expr(alias)} <> 'closed'"
+
+
+def _relationship_filter(network: str) -> str:
+    """Map network mode to APOC relationship filter syntax (direction-agnostic for robustness)."""
+    mode = (network or "auto").lower()
+    if mode == "metro":
+        return "METRO_LINK"
+    if mode == "rail":
+        return "RAIL_LINK"
+    return "METRO_LINK|RAIL_LINK|INTERCHANGE_TO"
+
+
+def _ensure_weight_properties(session, fare_class: str = "standard") -> dict[str, float]:
+    """
+    Read-only compatibility helper.
+
+    In production, weight properties should be pre-seeded (e.g. route_time_weight,
+    route_fare_weight). This helper intentionally does NOT mutate the graph.
+    It only returns multipliers used by query-time fare fallback logic.
+    """
+    _ = session
+    first_multiplier = 1.6 if (fare_class or "standard").lower() == "first" else 1.0
+    return {"first_multiplier": first_multiplier}
+
+
+def _route_meta(
+    network_mode: str,
+    route_type: str,
+    traversal_strategy: str,
+    disrupted_nodes_avoided: bool = True,
+    interchange_count: int = 0,
+) -> dict:
+    """Stable metadata block for AI/tool consumers."""
+    return {
+        "network_mode": network_mode,
+        "route_type": route_type,
+        "interchange_count": interchange_count,
+        "disrupted_nodes_avoided": disrupted_nodes_avoided,
+        "traversal_strategy": traversal_strategy,
+    }
+
+
+def _base_route_result(origin_id: str, destination_id: str) -> dict:
+    """Standardized route response used by shortest/cheapest/interchange queries."""
+    return {
+        "found": False,
+        "origin_id": origin_id,
+        "destination_id": destination_id,
+        "total_time_min": None,
+        "total_fare_usd": None,
+        "stations": [],
+        "legs": [],
+        **_route_meta(network_mode="auto", route_type="route", traversal_strategy="unknown"),
+    }
+
+
+def _structured_error(code: str, message: str, retriable: bool = False, details: Optional[str] = None) -> dict:
+    return {
+        "code": code,
+        "message": message,
+        "retriable": retriable,
+        "details": details,
+    }
+
+
+def _error_from_exception(exc: Exception) -> dict:
+    message = str(exc) or "Neo4j query failed."
+    if isinstance(exc, (ServiceUnavailable, SessionExpired)):
+        return _structured_error("connection_error", "Neo4j connection error.", retriable=True, details=message)
+
+    if isinstance(exc, Neo4jError):
+        code = getattr(exc, "code", "") or ""
+        lowered = message.lower()
+        if "procedure" in lowered and "apoc" in lowered:
+            return _structured_error("apoc_unavailable", "APOC procedure unavailable.", details=message)
+        if "procedure.notfound" in code.lower():
+            return _structured_error("apoc_unavailable", "APOC procedure unavailable.", details=message)
+        if "timedout" in code.lower() or "timed out" in lowered:
+            return _structured_error("timeout", "Neo4j query timed out.", retriable=True, details=message)
+
+    return _structured_error("neo4j_error", "Neo4j query failed.", details=message)
+
+
+def _station_exists(session, station_id: str) -> bool:
+    # Favor indexed label lookup to avoid broader label/filter scans.
+    if _HAS_GENERIC_STATION_LABEL:
+        record = session.run(
+            """
+            MATCH (s:Station {station_id: $station_id})
+            RETURN true AS ok
+            LIMIT 1
+            """,
+            {"station_id": station_id},
+        ).single()
+        return bool(record and record["ok"])
+
+    record = session.run(
+        """
+        MATCH (s:MetroStation {station_id: $station_id})
+        RETURN true AS ok
+        LIMIT 1
+        UNION
+        MATCH (s:NationalRailStation {station_id: $station_id})
+        RETURN true AS ok
+        LIMIT 1
+        """,
+        {"station_id": station_id},
+    ).single()
+    return bool(record and record["ok"])
+
+
+def _has_relationship_weight(session, prop_name: str) -> bool:
+    """Check whether a route weight property exists on any traversable relationship."""
+    cached = _REL_WEIGHT_CAPABILITY_CACHE.get(prop_name)
+    if cached is not None:
+        return cached
+
+    record = session.run(
+        """
+        MATCH ()-[r:METRO_LINK|RAIL_LINK|INTERCHANGE_TO]-()
+        WHERE properties(r)[$prop_name] IS NOT NULL
+        RETURN count(r) > 0 AS ok
+        """,
+        {"prop_name": prop_name},
+    ).single()
+    has_weight = bool(record and record["ok"])
+    _REL_WEIGHT_CAPABILITY_CACHE[prop_name] = has_weight
+    return has_weight
+
+
+def _with_route_errors(result: dict, error: dict) -> dict:
+    result["error"] = error
+    return result
+
+
+def _path_to_station_dicts(path) -> list[dict]:
+    return [
+        {
+            "station_id": node.get("station_id"),
+            "name": node.get("name"),
+            "labels": sorted(list(node.labels)),
+            "lines": node.get("lines") or [],
+            "status": node.get("status") or "open",
+        }
+        for node in path.nodes
+    ]
+
+
+def _path_to_leg_dicts(path) -> list[dict]:
+    legs: list[dict] = []
+    for idx, rel in enumerate(path.relationships):
+        frm = path.nodes[idx]
+        to = path.nodes[idx + 1]
+        legs.append(
+            {
+                "from_station_id": frm.get("station_id"),
+                "from_name": frm.get("name"),
+                "to_station_id": to.get("station_id"),
+                "to_name": to.get("name"),
+                "relationship_type": rel.type,
+                "line": rel.get("line"),
+                "service_type": rel.get("service_type"),
+                "travel_time_min": rel.get("travel_time_min"),
+                "transfer_time_min": rel.get("transfer_time_min"),
+                "distance_km": rel.get("distance_km"),
+            }
+        )
+    return legs
 
 
 # ── Example ───────────────────────────────────────────────────────────────────
@@ -66,9 +273,113 @@ def query_shortest_route(
 
     Returns:
         dict with keys: found, origin_id, destination_id,
-                        total_time_min, path (list of station dicts), legs
+                        total_time_min, total_fare_usd, stations, legs
     """
-    raise NotImplementedError("TODO: implement after designing your graph schema")
+    rel_filter = _relationship_filter(network)
+    base_result = _base_route_result(origin_id, destination_id)
+    base_result.update(_route_meta(network_mode=network, route_type="shortest", traversal_strategy="dijkstra_route_time_weight"))
+
+    with _driver() as driver:
+        with driver.session() as session:
+            try:
+                _load_station_label_support(session)
+                if not _station_exists(session, origin_id):
+                    return _with_route_errors(
+                        base_result,
+                        _structured_error("invalid_station", f"Origin station not found: {origin_id}"),
+                    )
+                if not _station_exists(session, destination_id):
+                    return _with_route_errors(
+                        base_result,
+                        _structured_error("invalid_station", f"Destination station not found: {destination_id}"),
+                    )
+
+                if _has_relationship_weight(session, "route_time_weight"):
+                    base_result["traversal_strategy"] = "dijkstra_route_time_weight"
+                    record = session.run(
+                        f"""
+                        MATCH (origin {{station_id: $origin_id}}), (destination {{station_id: $destination_id}})
+                        WHERE {_station_labels_filter('origin')}
+                          AND {_station_labels_filter('destination')}
+                          AND {_not_closed_expr('origin')}
+                          AND {_not_closed_expr('destination')}
+                        CALL apoc.algo.dijkstra(origin, destination, $rel_filter, 'route_time_weight')
+                        YIELD path, weight
+                        WHERE all(node IN nodes(path) WHERE {_not_closed_expr('node')})
+                        RETURN path, weight
+                        LIMIT 1
+                        """,
+                        {
+                            "origin_id": origin_id,
+                            "destination_id": destination_id,
+                            "rel_filter": rel_filter,
+                        },
+                    ).single()
+                else:
+                    # Fallback for unweighted graphs: BFS expansion then choose minimum travel time.
+                    base_result["traversal_strategy"] = "apoc_expand_bfs_time_fallback"
+                    record = session.run(
+                        f"""
+                        MATCH (origin {{station_id: $origin_id}}), (destination {{station_id: $destination_id}})
+                        WHERE {_station_labels_filter('origin')}
+                          AND {_station_labels_filter('destination')}
+                          AND {_not_closed_expr('origin')}
+                          AND {_not_closed_expr('destination')}
+                        CALL apoc.path.expandConfig(origin, {{
+                            relationshipFilter: $rel_filter,
+                            minLevel: 1,
+                            maxLevel: 25,
+                            bfs: true,
+                            uniqueness: 'NODE_PATH',
+                            endNodes: [destination],
+                            filterStartNode: true,
+                            limit: 300
+                        }}) YIELD path
+                        WHERE last(nodes(path)).station_id = $destination_id
+                          AND all(node IN nodes(path) WHERE {_not_closed_expr('node')})
+                        WITH path,
+                             reduce(total = 0.0, rel IN relationships(path) |
+                                total + coalesce(rel.travel_time_min, rel.transfer_time_min, 1.0)
+                             ) AS weight
+                        RETURN path, weight
+                        ORDER BY weight ASC, length(path) ASC
+                        LIMIT 1
+                        """,
+                        {
+                            "origin_id": origin_id,
+                            "destination_id": destination_id,
+                            "rel_filter": rel_filter,
+                        },
+                    ).single()
+            except Exception as exc:
+                return _with_route_errors(base_result, _error_from_exception(exc))
+
+    if not record:
+        return _with_route_errors(
+            base_result,
+            _structured_error("disconnected_path", "No route found between origin and destination."),
+        )
+
+    route_path = record["path"]
+    stations = _path_to_station_dicts(route_path)
+    legs = _path_to_leg_dicts(route_path)
+    interchange_count = sum(1 for leg in legs if leg["relationship_type"] == "INTERCHANGE_TO")
+    return {
+        "found": True,
+        "origin_id": origin_id,
+        "destination_id": destination_id,
+        "total_time_min": round(record["weight"], 2) if record["weight"] is not None else None,
+        "total_fare_usd": None,
+        "stations": stations,
+        "legs": legs,
+        **_route_meta(
+            network_mode=network,
+            route_type="shortest",
+            traversal_strategy=base_result["traversal_strategy"],
+            disrupted_nodes_avoided=True,
+            interchange_count=interchange_count,
+        ),
+    }
 
 
 # ── CHEAPEST ROUTE (Dijkstra by fare) ────────────────────────────────────────
@@ -89,9 +400,150 @@ def query_cheapest_route(
         fare_class:      "standard" or "first" (national rail only)
 
     Returns:
-        dict with found, total_fare_usd (approximate), stations, legs
+        dict with found, total_time_min, total_fare_usd (approximate), stations, legs
     """
-    raise NotImplementedError("TODO: implement after designing your graph schema")
+    rel_filter = _relationship_filter(network)
+    fare_class = (fare_class or "standard").lower()
+    if fare_class not in {"standard", "first"}:
+        fare_class = "standard"
+    base_result = _base_route_result(origin_id, destination_id)
+    base_result["fare_class"] = fare_class
+    base_result["fare_breakdown"] = []
+    base_result.update(_route_meta(network_mode=network, route_type="cheapest", traversal_strategy="dijkstra_route_fare_weight"))
+
+    with _driver() as driver:
+        with driver.session() as session:
+            try:
+                fare_cfg = _ensure_weight_properties(session, fare_class=fare_class)
+                _load_station_label_support(session)
+                if not _station_exists(session, origin_id):
+                    return _with_route_errors(
+                        base_result,
+                        _structured_error("invalid_station", f"Origin station not found: {origin_id}"),
+                    )
+                if not _station_exists(session, destination_id):
+                    return _with_route_errors(
+                        base_result,
+                        _structured_error("invalid_station", f"Destination station not found: {destination_id}"),
+                    )
+
+                if _has_relationship_weight(session, "route_fare_weight"):
+                    base_result["traversal_strategy"] = "dijkstra_route_fare_weight"
+                    record = session.run(
+                        f"""
+                        MATCH (origin {{station_id: $origin_id}}), (destination {{station_id: $destination_id}})
+                        WHERE {_station_labels_filter('origin')}
+                          AND {_station_labels_filter('destination')}
+                          AND {_not_closed_expr('origin')}
+                          AND {_not_closed_expr('destination')}
+                        CALL apoc.algo.dijkstra(origin, destination, $rel_filter, 'route_fare_weight')
+                        YIELD path, weight
+                        WHERE all(node IN nodes(path) WHERE {_not_closed_expr('node')})
+                        RETURN path, weight
+                        LIMIT 1
+                        """,
+                        {
+                            "origin_id": origin_id,
+                            "destination_id": destination_id,
+                            "rel_filter": rel_filter,
+                        },
+                    ).single()
+                else:
+                    # Fallback for graphs without precomputed fare weights.
+                    base_result["traversal_strategy"] = "apoc_expand_bfs_fare_fallback"
+                    record = session.run(
+                        f"""
+                        MATCH (origin {{station_id: $origin_id}}), (destination {{station_id: $destination_id}})
+                        WHERE {_station_labels_filter('origin')}
+                          AND {_station_labels_filter('destination')}
+                          AND {_not_closed_expr('origin')}
+                          AND {_not_closed_expr('destination')}
+                        CALL apoc.path.expandConfig(origin, {{
+                            relationshipFilter: $rel_filter,
+                            minLevel: 1,
+                            maxLevel: 25,
+                            bfs: true,
+                            uniqueness: 'NODE_PATH',
+                            endNodes: [destination],
+                            filterStartNode: true,
+                            limit: 300
+                        }}) YIELD path
+                        WHERE last(nodes(path)).station_id = $destination_id
+                          AND all(node IN nodes(path) WHERE {_not_closed_expr('node')})
+                        WITH path,
+                             reduce(total = 0.0, rel IN relationships(path) |
+                                total +
+                                CASE
+                                    WHEN type(rel) = 'INTERCHANGE_TO' THEN coalesce(rel.fare, 0.50)
+                                    ELSE coalesce(rel.fare, round(coalesce(rel.distance_km, 0.0) * 0.75 + 0.50, 2))
+                                END
+                             ) AS weight
+                        RETURN path, weight
+                        ORDER BY weight ASC, length(path) ASC
+                        LIMIT 1
+                        """,
+                        {
+                            "origin_id": origin_id,
+                            "destination_id": destination_id,
+                            "rel_filter": rel_filter,
+                        },
+                    ).single()
+            except Exception as exc:
+                return _with_route_errors(base_result, _error_from_exception(exc))
+
+    if not record:
+        return _with_route_errors(
+            base_result,
+            _structured_error("disconnected_path", "No route found between origin and destination."),
+        )
+
+    route_path = record["path"]
+    stations = _path_to_station_dicts(route_path)
+    legs = _path_to_leg_dicts(route_path)
+
+    first_multiplier = fare_cfg["first_multiplier"]
+    total_fare = 0.0
+    fare_breakdown = []
+    for rel in route_path.relationships:
+        base_fare = rel.get("fare")
+        if base_fare is None:
+            if rel.type == "INTERCHANGE_TO":
+                base_fare = 0.50
+            else:
+                base_fare = round((rel.get("distance_km") or 0.0) * 0.75 + 0.50, 2)
+
+        leg_fare = round(base_fare * first_multiplier, 2) if rel.type == "RAIL_LINK" else round(base_fare, 2)
+        total_fare += leg_fare
+        fare_breakdown.append(
+            {
+                "relationship_type": rel.type,
+                "line": rel.get("line"),
+                "fare_usd": leg_fare,
+                "fare_source": "relationship_fare" if rel.get("fare") is not None else "estimated_from_distance",
+            }
+        )
+
+    total_time = sum((leg.get("travel_time_min") or leg.get("transfer_time_min") or 0) for leg in legs)
+    interchange_count = sum(1 for leg in legs if leg["relationship_type"] == "INTERCHANGE_TO")
+
+    return {
+        "found": True,
+        "origin_id": origin_id,
+        "destination_id": destination_id,
+        "fare_class": fare_class,
+        "total_time_min": round(float(total_time), 2),
+        "total_fare_usd": round(float(total_fare), 2),
+        "stations": stations,
+        "legs": legs,
+        "fare_breakdown": fare_breakdown,
+        **_route_meta(
+            network_mode=network,
+            route_type="cheapest",
+            traversal_strategy=base_result["traversal_strategy"],
+            disrupted_nodes_avoided=True,
+            interchange_count=interchange_count,
+        ),
+    }
 
 
 # ── ALTERNATIVE ROUTES (avoiding a station) ───────────────────────────────────
@@ -117,7 +569,68 @@ def query_alternative_routes(
     Returns:
         List of routes, each route is a list of leg dicts
     """
-    raise NotImplementedError("TODO: implement after designing your graph schema")
+    rel_filter = _relationship_filter(network)
+    max_routes = max(1, min(int(max_routes), 10))
+    max_depth = 20
+
+    with _driver() as driver:
+        with driver.session() as session:
+            try:
+                _load_station_label_support(session)
+                records = session.run(
+                    f"""
+                    MATCH (origin {{station_id: $origin_id}}), (destination {{station_id: $destination_id}})
+                    OPTIONAL MATCH (avoid {{station_id: $avoid_station_id}})
+                    WHERE {_station_labels_filter('origin')}
+                      AND {_station_labels_filter('destination')}
+                      AND (avoid IS NULL OR {_station_labels_filter('avoid')})
+                      AND {_not_closed_expr('origin')}
+                      AND {_not_closed_expr('destination')}
+                    WITH origin, destination, CASE WHEN avoid IS NULL THEN [] ELSE [avoid] END AS blocked
+                    // BFS + NODE_PATH keeps traversal bounded and avoids combinatorial path explosion.
+                    CALL apoc.path.expandConfig(origin, {{
+                        relationshipFilter: $rel_filter,
+                        minLevel: 1,
+                        maxLevel: $max_depth,
+                        bfs: true,
+                        uniqueness: 'NODE_PATH',
+                        blacklistNodes: blocked,
+                        endNodes: [destination],
+                        filterStartNode: true,
+                        limit: $expand_limit
+                    }}) YIELD path
+                    WITH path
+                    WHERE last(nodes(path)).station_id = $destination_id
+                      AND all(node IN nodes(path) WHERE {_not_closed_expr('node')})
+                    WITH path,
+                         reduce(total = 0.0, rel IN relationships(path) |
+                            total + coalesce(rel.route_time_weight, rel.travel_time_min, rel.transfer_time_min, 1.0)
+                         ) AS total_time,
+                         [node IN nodes(path) | node.station_id] AS station_ids
+                    WITH path, total_time, apoc.text.join(station_ids, '>') AS signature
+                    ORDER BY total_time ASC, length(path) ASC
+                    WITH signature, head(collect(path)) AS selected_path
+                    RETURN selected_path AS path
+                    LIMIT $max_routes
+                    """,
+                    {
+                        "origin_id": origin_id,
+                        "destination_id": destination_id,
+                        "avoid_station_id": avoid_station_id,
+                        "rel_filter": rel_filter,
+                        "max_routes": max_routes,
+                        "max_depth": max_depth,
+                        "expand_limit": min(max(max_routes * 30, 60), 500),
+                    },
+                )
+                rows = list(records)
+            except (ServiceUnavailable, SessionExpired, Neo4jError):
+                return []
+
+    if not rows:
+        return []
+
+    return [_path_to_leg_dicts(row["path"]) for row in rows]
 
 
 # ── CROSS-NETWORK INTERCHANGE PATH ───────────────────────────────────────────
@@ -134,7 +647,120 @@ def query_interchange_path(origin_id: str, destination_id: str) -> dict:
     Returns:
         dict with found, stations list, interchange points, total_time_min
     """
-    raise NotImplementedError("TODO: implement after designing your graph schema")
+    base_result = _base_route_result(origin_id, destination_id)
+    base_result["interchange_points"] = []
+    base_result.update(_route_meta(network_mode="auto", route_type="interchange", traversal_strategy="dijkstra_route_time_weight"))
+
+    with _driver() as driver:
+        with driver.session() as session:
+            try:
+                _load_station_label_support(session)
+                if not _station_exists(session, origin_id):
+                    return _with_route_errors(
+                        base_result,
+                        _structured_error("invalid_station", f"Origin station not found: {origin_id}"),
+                    )
+                if not _station_exists(session, destination_id):
+                    return _with_route_errors(
+                        base_result,
+                        _structured_error("invalid_station", f"Destination station not found: {destination_id}"),
+                    )
+                if _has_relationship_weight(session, "route_time_weight"):
+                    base_result["traversal_strategy"] = "dijkstra_route_time_weight"
+                    record = session.run(
+                        f"""
+                        MATCH (origin {{station_id: $origin_id}}), (destination {{station_id: $destination_id}})
+                        WHERE {_station_labels_filter('origin')}
+                          AND {_station_labels_filter('destination')}
+                          AND {_not_closed_expr('origin')}
+                          AND {_not_closed_expr('destination')}
+                        CALL apoc.algo.dijkstra(origin, destination,
+                            'METRO_LINK|RAIL_LINK|INTERCHANGE_TO', 'route_time_weight')
+                        YIELD path, weight
+                        WHERE any(rel IN relationships(path) WHERE type(rel) = 'INTERCHANGE_TO')
+                          AND any(node IN nodes(path) WHERE node:MetroStation)
+                          AND any(node IN nodes(path) WHERE node:NationalRailStation)
+                          AND all(node IN nodes(path) WHERE {_not_closed_expr('node')})
+                        RETURN path, weight
+                        LIMIT 1
+                        """,
+                        {"origin_id": origin_id, "destination_id": destination_id},
+                    ).single()
+                else:
+                    base_result["traversal_strategy"] = "apoc_expand_bfs_interchange_fallback"
+                    record = session.run(
+                        f"""
+                        MATCH (origin {{station_id: $origin_id}}), (destination {{station_id: $destination_id}})
+                        WHERE {_station_labels_filter('origin')}
+                          AND {_station_labels_filter('destination')}
+                          AND {_not_closed_expr('origin')}
+                          AND {_not_closed_expr('destination')}
+                        CALL apoc.path.expandConfig(origin, {{
+                            relationshipFilter: 'METRO_LINK|RAIL_LINK|INTERCHANGE_TO',
+                            minLevel: 1,
+                            maxLevel: 25,
+                            bfs: true,
+                            uniqueness: 'NODE_PATH',
+                            endNodes: [destination],
+                            filterStartNode: true,
+                            limit: 350
+                        }}) YIELD path
+                        WHERE last(nodes(path)).station_id = $destination_id
+                          AND any(rel IN relationships(path) WHERE type(rel) = 'INTERCHANGE_TO')
+                          AND any(node IN nodes(path) WHERE node:MetroStation)
+                          AND any(node IN nodes(path) WHERE node:NationalRailStation)
+                          AND all(node IN nodes(path) WHERE {_not_closed_expr('node')})
+                        WITH path,
+                             reduce(total = 0.0, rel IN relationships(path) |
+                                total + coalesce(rel.travel_time_min, rel.transfer_time_min, 1.0)
+                             ) AS weight
+                        RETURN path, weight
+                        ORDER BY weight ASC, length(path) ASC
+                        LIMIT 1
+                        """,
+                        {"origin_id": origin_id, "destination_id": destination_id},
+                    ).single()
+            except Exception as exc:
+                return _with_route_errors(base_result, _error_from_exception(exc))
+
+    if not record:
+        return _with_route_errors(
+            base_result,
+            _structured_error("disconnected_path", "No interchange route found between origin and destination."),
+        )
+
+    route_path = record["path"]
+    stations = _path_to_station_dicts(route_path)
+    legs = _path_to_leg_dicts(route_path)
+    interchange_points = [
+        {
+            "from_station_id": leg["from_station_id"],
+            "from_name": leg["from_name"],
+            "to_station_id": leg["to_station_id"],
+            "to_name": leg["to_name"],
+            "transfer_time_min": leg["transfer_time_min"],
+        }
+        for leg in legs
+        if leg["relationship_type"] == "INTERCHANGE_TO"
+    ]
+
+    return {
+        "found": True,
+        "origin_id": origin_id,
+        "destination_id": destination_id,
+        "total_time_min": round(record["weight"], 2) if record["weight"] is not None else None,
+        "total_fare_usd": None,
+        "stations": stations,
+        "legs": legs,
+        "interchange_points": interchange_points,
+        **_route_meta(
+            network_mode="auto",
+            route_type="interchange",
+            traversal_strategy=base_result["traversal_strategy"],
+            disrupted_nodes_avoided=True,
+            interchange_count=len(interchange_points),
+        ),
+    }
 
 
 # ── DELAY RIPPLE ANALYSIS ─────────────────────────────────────────────────────
@@ -151,7 +777,42 @@ def query_delay_ripple(delayed_station_id: str, hops: int = 2) -> list[dict]:
     Returns:
         List of dicts: {station_id, name, hops_away, lines_affected}
     """
-    raise NotImplementedError("TODO: implement after designing your graph schema")
+    if hops <= 0:
+        return []
+    hops = min(int(hops), 6)
+
+    with _driver() as driver:
+        with driver.session() as session:
+            try:
+                _load_station_label_support(session)
+                records = session.run(
+                    f"""
+                    MATCH (start {{station_id: $delayed_station_id}})
+                    WHERE {_station_labels_filter('start')}
+                      AND {_not_closed_expr('start')}
+                                        // NODE_GLOBAL avoids revisiting stations across branches in ripple analysis.
+                    CALL apoc.path.expandConfig(start, {{
+                        relationshipFilter: 'METRO_LINK|RAIL_LINK|INTERCHANGE_TO',
+                        minLevel: 1,
+                        maxLevel: $hops,
+                        bfs: true,
+                        uniqueness: 'NODE_GLOBAL'
+                    }})
+                    YIELD path
+                    WITH last(nodes(path)) AS affected, min(length(path)) AS hops_away
+                    WHERE {_station_labels_filter('affected')}
+                      AND {_not_closed_expr('affected')}
+                    RETURN affected.station_id AS station_id,
+                           affected.name AS name,
+                           hops_away,
+                           coalesce(affected.lines, []) AS lines_affected
+                    ORDER BY hops_away ASC, station_id ASC
+                    """,
+                    {"delayed_station_id": delayed_station_id, "hops": hops},
+                )
+                return [dict(r) for r in records]
+            except (ServiceUnavailable, SessionExpired, Neo4jError):
+                return []
 
 
 # ── STATION CONNECTIONS ───────────────────────────────────────────────────────
@@ -163,4 +824,29 @@ def query_station_connections(station_id: str) -> list[dict]:
     Args:
         station_id: e.g. "MS01" or "NR01"
     """
-    raise NotImplementedError("TODO: implement after designing your graph schema")
+    with _driver() as driver:
+        with driver.session() as session:
+            try:
+                _load_station_label_support(session)
+                records = session.run(
+                    f"""
+                    MATCH (s {{station_id: $station_id}})-[rel:METRO_LINK|RAIL_LINK|INTERCHANGE_TO]-(n)
+                    WHERE {_station_labels_filter('s')}
+                      AND {_station_labels_filter('n')}
+                      AND {_not_closed_expr('s')}
+                      AND {_not_closed_expr('n')}
+                                        RETURN DISTINCT n.station_id AS station_id,
+                                                                        n.name AS name,
+                                                                        type(rel) AS relationship_type,
+                                                                        rel.line AS line,
+                                                                        coalesce(rel.travel_time_min, rel.transfer_time_min) AS travel_time_min,
+                                                                        rel.service_type AS service_type,
+                                                                        properties(rel)['distance_km'] AS distance_km,
+                                                                        rel.transfer_time_min AS transfer_time_min
+                    ORDER BY relationship_type, station_id
+                    """,
+                    {"station_id": station_id},
+                )
+                return [dict(r) for r in records]
+            except (ServiceUnavailable, SessionExpired, Neo4jError):
+                return []
