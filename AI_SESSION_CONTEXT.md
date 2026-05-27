@@ -317,6 +317,33 @@ def query_station_connections(station_id: str) -> list[dict]: ...
 - [ ] Graph schema: TODO — add your node label and relationship type decisions here
 - [ ] (example) Metro schedule stop ordering: using `jsonb_array_elements` approach — easier to debug than containment operators
 
+## Implementation Details
+
+### Phase 1 (seed_postgres.py) — ✅ COMPLETED
+
+**Status:** Helper functions added, code refactored for KC handoff. See [IMPROVEMENTS.md](IMPROVEMENTS.md) for full details.
+
+- [x] **`split_full_name()` helper function**: Decomposes `"Alice Tan"` → `first_name="Alice"`, `last_name="Tan"`. Used in `seed_users()` to split mock data.
+- [x] **`hash_secret()` helper function**: Hashes both password AND secret_answer with **argon2id**. Returns `None` if input is `None` (handles optional fields safely).
+- [x] **Email normalization**: Stored as lowercase (`.lower()`) for consistent queries across login flows.
+- [x] **Argon2id with embedded salt**: No separate salt column needed. MCF format stores salt + hash: `$argon2id$v=19$m=65536,t=3,p=4$[salt]$[hash]`.
+- [x] **Secret answer hashing**: CRITICAL — stored as argon2id hash, NOT plaintext. Verification pattern for KC: `ph.verify(db_secret_answer_hash, user_input_answer)`.
+- [x] **Idempotent seeding**: All INSERT statements use `ON CONFLICT DO NOTHING`, safe to re-run.
+
+**Key Notes for KC (queries.py):**
+- Password verification: `ph.verify(db_password_hash, user_input_password)` — salt is embedded in MCF hash
+- Secret answer verification: Same `ph.verify()` pattern
+- User credentials table: `user_id` (FK to users), `password_hash`, `secret_question`, `secret_answer_hash`, `deleted_at`
+
+### Phase 2+ (Coming) — NOT STARTED
+
+- [ ] `seed_metro_schedules()` — JSONB decomposition of `stops_in_order[]`
+- [ ] `seed_national_rail_schedules()` — JSONB `fare_classes` dict parsing
+- [ ] `seed_seat_layouts()` — Decompose `coaches[]` into separate rows
+- [ ] `seed_national_rail_bookings()` — FK lookup of `layout_id`
+- [ ] `seed_metro_travels()` — `day_pass_ref` self-reference handling (UPDATE after INSERT)
+- [ ] `seed_payments()` — Parse BK/MT reference type prefixes
+- [ ] `seed_feedback()` — Parse BK/MT reference type prefixes
 
 
 ## Prompts That Worked
