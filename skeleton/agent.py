@@ -428,7 +428,12 @@ def _execute_tool(
                 avoid_station_id=params["avoid_station_id"],
                 network=params.get("network", "auto"),
             )
-            result = [{"route_number": i + 1, "legs": r} for i, r in enumerate(routes)]
+            if isinstance(routes, dict):
+                # New graph-query shape already includes route metadata.
+                result = routes
+            else:
+                # Backward compatibility for legacy list return.
+                result = [{"route_number": i + 1, "legs": r} for i, r in enumerate(routes)]
 
         elif tool_name == "get_delay_ripple":
             result = query_delay_ripple(

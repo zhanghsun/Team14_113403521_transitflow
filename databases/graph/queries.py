@@ -35,31 +35,11 @@ def _driver():
     return GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
 
 
-_HAS_GENERIC_STATION_LABEL: Optional[bool] = None
 _REL_WEIGHT_CAPABILITY_CACHE: dict[str, bool] = {}
 
 
-def _load_station_label_support(session) -> None:
-    """Probe once per process whether the graph has a generic :Station label."""
-    global _HAS_GENERIC_STATION_LABEL
-    if _HAS_GENERIC_STATION_LABEL is not None:
-        return
-    try:
-        rec = session.run(
-            """
-            CALL db.labels() YIELD label
-            RETURN any(x IN collect(label) WHERE x = 'Station') AS has_station
-            """
-        ).single()
-        _HAS_GENERIC_STATION_LABEL = bool(rec and rec["has_station"])
-    except Neo4jError:
-        _HAS_GENERIC_STATION_LABEL = False
-
-
 def _station_labels_filter(alias: str) -> str:
-    """Reusable node-label filter for station lookups (supports optional generic :Station)."""
-    if _HAS_GENERIC_STATION_LABEL:
-        return f"({alias}:Station OR {alias}:MetroStation OR {alias}:NationalRailStation)"
+    """Reusable node-label filter for station lookups."""
     return f"({alias}:MetroStation OR {alias}:NationalRailStation)"
 
 
@@ -113,6 +93,35 @@ def _route_meta(
     }
 
 
+def _fare_cost_expr(rel_alias: str, fare_class: str) -> str:
+    """Return a Cypher expression for the active fare class and edge type."""
+    if fare_class == "first":
+        return (
+            f"CASE type({rel_alias}) "
+            f"WHEN 'METRO_LINK' THEN coalesce({rel_alias}.cost_usd, {rel_alias}.route_fare_weight, 0.0) "
+            f"WHEN 'RAIL_LINK' THEN coalesce({rel_alias}.cost_first_usd, {rel_alias}.cost_standard_usd, {rel_alias}.route_fare_weight, 0.0) "
+            f"WHEN 'INTERCHANGE_TO' THEN coalesce({rel_alias}.route_fare_weight, 0.0) "
+            f"ELSE 0.0 END"
+        )
+    return (
+        f"CASE type({rel_alias}) "
+        f"WHEN 'METRO_LINK' THEN coalesce({rel_alias}.cost_usd, {rel_alias}.route_fare_weight, 0.0) "
+        f"WHEN 'RAIL_LINK' THEN coalesce({rel_alias}.cost_standard_usd, {rel_alias}.route_fare_weight, 0.0) "
+        f"WHEN 'INTERCHANGE_TO' THEN coalesce({rel_alias}.route_fare_weight, 0.0) "
+        f"ELSE 0.0 END"
+    )
+
+
+def _path_is_open_expr(path_alias: str = "path") -> str:
+    """Reusable path validation for disruption-aware traversal."""
+    return f"all(node IN nodes({path_alias}) WHERE {_not_closed_expr('node')})"
+
+
+def _path_has_interchange_expr(path_alias: str = "path") -> str:
+    """Reusable expression for interchange path validation."""
+    return f"any(rel IN relationships({path_alias}) WHERE type(rel) = 'INTERCHANGE_TO')"
+
+
 def _base_route_result(origin_id: str, destination_id: str) -> dict:
     """Standardized route response used by shortest/cheapest/interchange queries."""
     return {
@@ -155,30 +164,16 @@ def _error_from_exception(exc: Exception) -> dict:
 
 
 def _station_exists(session, station_id: str) -> bool:
-    # Favor indexed label lookup to avoid broader label/filter scans.
-    if _HAS_GENERIC_STATION_LABEL:
-        record = session.run(
-            """
-            MATCH (s:Station {station_id: $station_id})
-            RETURN true AS ok
-            LIMIT 1
-            """,
-            {"station_id": station_id},
-        ).single()
-        return bool(record and record["ok"])
+    # Use the station ID prefix so the lookup hits the correct label index directly.
+    if station_id.startswith("MS"):
+        query = "MATCH (s:MetroStation {station_id: $station_id}) RETURN true AS ok LIMIT 1"
+    elif station_id.startswith("NR"):
+        query = "MATCH (s:NationalRailStation {station_id: $station_id}) RETURN true AS ok LIMIT 1"
+    else:
+        # Fallback for unexpected IDs keeps compatibility without UNION or graph-wide scans.
+        query = "MATCH (s {station_id: $station_id}) WHERE s:MetroStation OR s:NationalRailStation RETURN true AS ok LIMIT 1"
 
-    record = session.run(
-        """
-        MATCH (s:MetroStation {station_id: $station_id})
-        RETURN true AS ok
-        LIMIT 1
-        UNION
-        MATCH (s:NationalRailStation {station_id: $station_id})
-        RETURN true AS ok
-        LIMIT 1
-        """,
-        {"station_id": station_id},
-    ).single()
+    record = session.run(query, {"station_id": station_id}).single()
     return bool(record and record["ok"])
 
 
@@ -236,6 +231,11 @@ def _path_to_leg_dicts(path) -> list[dict]:
                 "travel_time_min": rel.get("travel_time_min"),
                 "transfer_time_min": rel.get("transfer_time_min"),
                 "distance_km": rel.get("distance_km"),
+                "cost_usd": rel.get("cost_usd"),
+                "cost_standard_usd": rel.get("cost_standard_usd"),
+                "cost_first_usd": rel.get("cost_first_usd"),
+                "route_time_weight": rel.get("route_time_weight"),
+                "route_fare_weight": rel.get("route_fare_weight"),
             }
         )
     return legs
@@ -282,7 +282,6 @@ def query_shortest_route(
     with _driver() as driver:
         with driver.session() as session:
             try:
-                _load_station_label_support(session)
                 if not _station_exists(session, origin_id):
                     return _with_route_errors(
                         base_result,
@@ -305,7 +304,7 @@ def query_shortest_route(
                           AND {_not_closed_expr('destination')}
                         CALL apoc.algo.dijkstra(origin, destination, $rel_filter, 'route_time_weight')
                         YIELD path, weight
-                        WHERE all(node IN nodes(path) WHERE {_not_closed_expr('node')})
+                        WHERE {_path_is_open_expr('path')}
                         RETURN path, weight
                         LIMIT 1
                         """,
@@ -336,7 +335,7 @@ def query_shortest_route(
                             limit: 300
                         }}) YIELD path
                         WHERE last(nodes(path)).station_id = $destination_id
-                          AND all(node IN nodes(path) WHERE {_not_closed_expr('node')})
+                                                    AND {_path_is_open_expr('path')}
                         WITH path,
                              reduce(total = 0.0, rel IN relationships(path) |
                                 total + coalesce(rel.travel_time_min, rel.transfer_time_min, 1.0)
@@ -415,7 +414,6 @@ def query_cheapest_route(
         with driver.session() as session:
             try:
                 fare_cfg = _ensure_weight_properties(session, fare_class=fare_class)
-                _load_station_label_support(session)
                 if not _station_exists(session, origin_id):
                     return _with_route_errors(
                         base_result,
@@ -427,7 +425,7 @@ def query_cheapest_route(
                         _structured_error("invalid_station", f"Destination station not found: {destination_id}"),
                     )
 
-                if _has_relationship_weight(session, "route_fare_weight"):
+                if fare_class != "first" and _has_relationship_weight(session, "route_fare_weight"):
                     base_result["traversal_strategy"] = "dijkstra_route_fare_weight"
                     record = session.run(
                         f"""
@@ -438,7 +436,7 @@ def query_cheapest_route(
                           AND {_not_closed_expr('destination')}
                         CALL apoc.algo.dijkstra(origin, destination, $rel_filter, 'route_fare_weight')
                         YIELD path, weight
-                        WHERE all(node IN nodes(path) WHERE {_not_closed_expr('node')})
+                        WHERE {_path_is_open_expr('path')}
                         RETURN path, weight
                         LIMIT 1
                         """,
@@ -449,7 +447,7 @@ def query_cheapest_route(
                         },
                     ).single()
                 else:
-                    # Fallback for graphs without precomputed fare weights.
+                    # Fallback for graphs without precomputed fare weights, or when first-class pricing is requested.
                     base_result["traversal_strategy"] = "apoc_expand_bfs_fare_fallback"
                     record = session.run(
                         f"""
@@ -469,14 +467,10 @@ def query_cheapest_route(
                             limit: 300
                         }}) YIELD path
                         WHERE last(nodes(path)).station_id = $destination_id
-                          AND all(node IN nodes(path) WHERE {_not_closed_expr('node')})
+                                                    AND {_path_is_open_expr('path')}
                         WITH path,
                              reduce(total = 0.0, rel IN relationships(path) |
-                                total +
-                                CASE
-                                    WHEN type(rel) = 'INTERCHANGE_TO' THEN coalesce(rel.fare, 0.50)
-                                    ELSE coalesce(rel.fare, round(coalesce(rel.distance_km, 0.0) * 0.75 + 0.50, 2))
-                                END
+                                total + ({_fare_cost_expr('rel', fare_class)})
                              ) AS weight
                         RETURN path, weight
                         ORDER BY weight ASC, length(path) ASC
@@ -501,25 +495,34 @@ def query_cheapest_route(
     stations = _path_to_station_dicts(route_path)
     legs = _path_to_leg_dicts(route_path)
 
-    first_multiplier = fare_cfg["first_multiplier"]
     total_fare = 0.0
     fare_breakdown = []
     for rel in route_path.relationships:
-        base_fare = rel.get("fare")
-        if base_fare is None:
-            if rel.type == "INTERCHANGE_TO":
-                base_fare = 0.50
-            else:
-                base_fare = round((rel.get("distance_km") or 0.0) * 0.75 + 0.50, 2)
-
-        leg_fare = round(base_fare * first_multiplier, 2) if rel.type == "RAIL_LINK" else round(base_fare, 2)
+        if fare_class == "first":
+            leg_fare = (
+                rel.get("cost_usd")
+                if rel.type == "METRO_LINK"
+                else rel.get("cost_first_usd")
+                if rel.type == "RAIL_LINK"
+                else rel.get("route_fare_weight")
+            )
+        else:
+            leg_fare = (
+                rel.get("cost_usd")
+                if rel.type == "METRO_LINK"
+                else rel.get("cost_standard_usd")
+                if rel.type == "RAIL_LINK"
+                else rel.get("route_fare_weight")
+            )
+        if leg_fare is None:
+            leg_fare = 0.0
         total_fare += leg_fare
         fare_breakdown.append(
             {
                 "relationship_type": rel.type,
                 "line": rel.get("line"),
                 "fare_usd": leg_fare,
-                "fare_source": "relationship_fare" if rel.get("fare") is not None else "estimated_from_distance",
+                "fare_source": "new_schema_cost_field" if rel.type in {"METRO_LINK", "RAIL_LINK"} else "interchange_transfer",
             }
         )
 
@@ -554,7 +557,7 @@ def query_alternative_routes(
     avoid_station_id: str,
     network: str = "auto",
     max_routes: int = 3,
-) -> list[list[dict]]:
+) -> dict:
     """
     Find paths between two stations that avoid a specific intermediate station.
     Useful for routing around a delayed or closed station.
@@ -567,16 +570,23 @@ def query_alternative_routes(
         max_routes:        max number of alternatives to return
 
     Returns:
-        List of routes, each route is a list of leg dicts
+        dict with found, origin_id, destination_id, avoided_station_id, routes, route_count
     """
     rel_filter = _relationship_filter(network)
     max_routes = max(1, min(int(max_routes), 10))
-    max_depth = 20
+    max_depth = 16
+    base_result = {
+        "found": False,
+        "origin_id": origin_id,
+        "destination_id": destination_id,
+        "avoided_station_id": avoid_station_id,
+        "routes": [],
+        "route_count": 0,
+    }
 
     with _driver() as driver:
         with driver.session() as session:
             try:
-                _load_station_label_support(session)
                 records = session.run(
                     f"""
                     MATCH (origin {{station_id: $origin_id}}), (destination {{station_id: $destination_id}})
@@ -601,7 +611,7 @@ def query_alternative_routes(
                     }}) YIELD path
                     WITH path
                     WHERE last(nodes(path)).station_id = $destination_id
-                      AND all(node IN nodes(path) WHERE {_not_closed_expr('node')})
+                                            AND {_path_is_open_expr('path')}
                     WITH path,
                          reduce(total = 0.0, rel IN relationships(path) |
                             total + coalesce(rel.route_time_weight, rel.travel_time_min, rel.transfer_time_min, 1.0)
@@ -620,17 +630,31 @@ def query_alternative_routes(
                         "rel_filter": rel_filter,
                         "max_routes": max_routes,
                         "max_depth": max_depth,
-                        "expand_limit": min(max(max_routes * 30, 60), 500),
+                        "expand_limit": min(max(max_routes * 20, 40), 250),
                     },
                 )
                 rows = list(records)
             except (ServiceUnavailable, SessionExpired, Neo4jError):
-                return []
+                result = dict(base_result)
+                result["error"] = _structured_error(
+                    "neo4j_error",
+                    "Alternative route traversal failed.",
+                    retriable=True,
+                )
+                return result
 
     if not rows:
-        return []
+        return base_result
 
-    return [_path_to_leg_dicts(row["path"]) for row in rows]
+    routes = [_path_to_leg_dicts(row["path"]) for row in rows]
+    return {
+        "found": True,
+        "origin_id": origin_id,
+        "destination_id": destination_id,
+        "avoided_station_id": avoid_station_id,
+        "routes": routes,
+        "route_count": len(routes),
+    }
 
 
 # ── CROSS-NETWORK INTERCHANGE PATH ───────────────────────────────────────────
@@ -654,7 +678,6 @@ def query_interchange_path(origin_id: str, destination_id: str) -> dict:
     with _driver() as driver:
         with driver.session() as session:
             try:
-                _load_station_label_support(session)
                 if not _station_exists(session, origin_id):
                     return _with_route_errors(
                         base_result,
@@ -677,10 +700,10 @@ def query_interchange_path(origin_id: str, destination_id: str) -> dict:
                         CALL apoc.algo.dijkstra(origin, destination,
                             'METRO_LINK|RAIL_LINK|INTERCHANGE_TO', 'route_time_weight')
                         YIELD path, weight
-                        WHERE any(rel IN relationships(path) WHERE type(rel) = 'INTERCHANGE_TO')
+                                                WHERE {_path_has_interchange_expr('path')}
                           AND any(node IN nodes(path) WHERE node:MetroStation)
                           AND any(node IN nodes(path) WHERE node:NationalRailStation)
-                          AND all(node IN nodes(path) WHERE {_not_closed_expr('node')})
+                                                    AND {_path_is_open_expr('path')}
                         RETURN path, weight
                         LIMIT 1
                         """,
@@ -706,10 +729,10 @@ def query_interchange_path(origin_id: str, destination_id: str) -> dict:
                             limit: 350
                         }}) YIELD path
                         WHERE last(nodes(path)).station_id = $destination_id
-                          AND any(rel IN relationships(path) WHERE type(rel) = 'INTERCHANGE_TO')
+                                                    AND {_path_has_interchange_expr('path')}
                           AND any(node IN nodes(path) WHERE node:MetroStation)
                           AND any(node IN nodes(path) WHERE node:NationalRailStation)
-                          AND all(node IN nodes(path) WHERE {_not_closed_expr('node')})
+                                                    AND {_path_is_open_expr('path')}
                         WITH path,
                              reduce(total = 0.0, rel IN relationships(path) |
                                 total + coalesce(rel.travel_time_min, rel.transfer_time_min, 1.0)
@@ -784,13 +807,12 @@ def query_delay_ripple(delayed_station_id: str, hops: int = 2) -> list[dict]:
     with _driver() as driver:
         with driver.session() as session:
             try:
-                _load_station_label_support(session)
                 records = session.run(
                     f"""
                     MATCH (start {{station_id: $delayed_station_id}})
                     WHERE {_station_labels_filter('start')}
                       AND {_not_closed_expr('start')}
-                                        // NODE_GLOBAL avoids revisiting stations across branches in ripple analysis.
+                    // NODE_GLOBAL avoids revisiting stations across branches in ripple analysis.
                     CALL apoc.path.expandConfig(start, {{
                         relationshipFilter: 'METRO_LINK|RAIL_LINK|INTERCHANGE_TO',
                         minLevel: 1,
@@ -799,6 +821,7 @@ def query_delay_ripple(delayed_station_id: str, hops: int = 2) -> list[dict]:
                         uniqueness: 'NODE_GLOBAL'
                     }})
                     YIELD path
+                    WHERE {_path_is_open_expr('path')}
                     WITH last(nodes(path)) AS affected, min(length(path)) AS hops_away
                     WHERE {_station_labels_filter('affected')}
                       AND {_not_closed_expr('affected')}
@@ -810,7 +833,16 @@ def query_delay_ripple(delayed_station_id: str, hops: int = 2) -> list[dict]:
                     """,
                     {"delayed_station_id": delayed_station_id, "hops": hops},
                 )
-                return [dict(r) for r in records]
+                rows = [dict(r) for r in records]
+                # Defensive dedup to avoid path inflation edge cases in larger graphs.
+                dedup: dict[str, dict] = {}
+                for row in rows:
+                    sid = row.get("station_id")
+                    if sid is None:
+                        continue
+                    if sid not in dedup or row["hops_away"] < dedup[sid]["hops_away"]:
+                        dedup[sid] = row
+                return sorted(dedup.values(), key=lambda x: (x["hops_away"], x["station_id"]))
             except (ServiceUnavailable, SessionExpired, Neo4jError):
                 return []
 
@@ -827,7 +859,6 @@ def query_station_connections(station_id: str) -> list[dict]:
     with _driver() as driver:
         with driver.session() as session:
             try:
-                _load_station_label_support(session)
                 records = session.run(
                     f"""
                     MATCH (s {{station_id: $station_id}})-[rel:METRO_LINK|RAIL_LINK|INTERCHANGE_TO]-(n)
@@ -835,14 +866,19 @@ def query_station_connections(station_id: str) -> list[dict]:
                       AND {_station_labels_filter('n')}
                       AND {_not_closed_expr('s')}
                       AND {_not_closed_expr('n')}
-                                        RETURN DISTINCT n.station_id AS station_id,
-                                                                        n.name AS name,
-                                                                        type(rel) AS relationship_type,
-                                                                        rel.line AS line,
-                                                                        coalesce(rel.travel_time_min, rel.transfer_time_min) AS travel_time_min,
-                                                                        rel.service_type AS service_type,
-                                                                        properties(rel)['distance_km'] AS distance_km,
-                                                                        rel.transfer_time_min AS transfer_time_min
+                                            RETURN DISTINCT n.station_id AS station_id,
+                                                            n.name AS name,
+                                                            type(rel) AS relationship_type,
+                                                            rel.line AS line,
+                                                            coalesce(rel.travel_time_min, rel.transfer_time_min) AS travel_time_min,
+                                                            rel.service_type AS service_type,
+                                                            properties(rel)['distance_km'] AS distance_km,
+                                                            rel.transfer_time_min AS transfer_time_min,
+                                                            rel.cost_usd AS cost_usd,
+                                                            rel.cost_standard_usd AS cost_standard_usd,
+                                                            rel.cost_first_usd AS cost_first_usd,
+                                                            rel.route_time_weight AS route_time_weight,
+                                                            rel.route_fare_weight AS route_fare_weight
                     ORDER BY relationship_type, station_id
                     """,
                     {"station_id": station_id},
