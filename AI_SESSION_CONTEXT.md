@@ -232,20 +232,331 @@ CREATE TABLE policy_documents (
 ## Agreed Graph Schema
 
 <!-- ============================================================
-  FILL THIS IN after your team agrees on Neo4j node labels and
-  relationship types.
-  ============================================================ -->
+    Neo4j Graph Schema (Agreed)
+    This section documents node labels, relationship types, properties,
+    and conventions used by `databases/graph/queries.py` and
+    `skeleton/seed_neo4j.py`.
+    ============================================================ -->
 
-```
-Node labels:
-- TODO
+### Overview
 
-Relationship types:
-- TODO
+The graph model represents physical stations (metro and national rail),
+the links between them (service edges), and interchange connections
+used for multimodal routing and disruption analysis. Nodes are
+lightweight and focused on traversal attributes (ids, geo, type,
+operational flags). Relationships are directional but modeled as
+bidirectional logical links via twin edges (see seeding conventions).
 
-Key properties:
-- TODO
-```
+---
+
+### Node Labels
+
+- `MetroStation`
+    - Purpose: Represents a metro/underground stop used for short-haul,
+        high-frequency routing inside the metro network.
+    - Key properties:
+        - `station_id` (STRING, unique natural key)
+        - `name` (STRING)
+        - `lat` / `lon` (FLOAT)
+        - `lines` (LIST of STRING) — lines that serve the station
+        - `is_interchange_metro` (BOOLEAN)
+        - `is_interchange_national_rail` (BOOLEAN)
+        - `operational` (BOOLEAN) — current service availability flag
+    - Small Cypher example:
+        ```cypher
+        MERGE (s:MetroStation {station_id: $station_id})
+            SET s.name = $name, s.lat = $lat, s.lon = $lon, s.lines = $lines
+        RETURN s
+        ```
+
+- `NationalRailStation`
+    - Purpose: Represents mainline or regional rail stations used for
+        longer-distance services with fare-class complexity and seat
+        allocation metadata.
+    - Key properties:
+        - `station_id` (STRING, unique natural key)
+        - `name` (STRING)
+        - `lat` / `lon` (FLOAT)
+        - `lines` (LIST of STRING)
+        - `is_interchange_national_rail` (BOOLEAN)
+        - `is_interchange_metro` (BOOLEAN)
+        - `operational` (BOOLEAN)
+        - `fare_zone` (OPTIONAL STRING)
+    - Small Cypher example:
+        ```cypher
+        MERGE (r:NationalRailStation {station_id: $station_id})
+            SET r.name = $name, r.lat = $lat, r.lon = $lon, r.fare_zone = $zone
+        RETURN r
+        ```
+
+---
+
+### Relationship Types
+
+- `METRO_LINK`
+    - Purpose: Connects neighboring `MetroStation` nodes representing
+        a scheduled service or physical track segment on a given line.
+    - Key properties:
+        - `line` (STRING)
+        - `travel_time_min` (INTEGER) — nominal travel time in minutes
+        - `distance_m` (INTEGER) — optional geographic distance in meters
+        - `weight` (FLOAT) — precomputed routing weight (see seeding)
+        - `operational` (BOOLEAN)
+    - Traversal usage:
+        - Used for shortest-paths, time-weighted Dijkstra, and APOC
+            k-shortest-path traversals inside the metro subgraph.
+        - `weight` is preferred by route-finding algorithms.
+    - Cypher example:
+        ```cypher
+        MATCH (a:MetroStation {station_id:$from}), (b:MetroStation {station_id:$to})
+        MERGE (a)-[r:METRO_LINK {line:$line}]->(b)
+            SET r.travel_time_min = $t, r.distance_m = $d, r.weight = $w
+        RETURN r
+        ```
+
+- `RAIL_LINK`
+    - Purpose: Connects `NationalRailStation` nodes representing scheduled
+        or express rail links, often with larger travel-times and fare
+        attributes.
+    - Key properties:
+        - `service_id` (STRING) — optional schedule/svc id
+        - `travel_time_min` (INTEGER)
+        - `distance_m` (INTEGER)
+        - `fare_base` (NUMERIC) — base fare used in simple fare heuristics
+        - `weight` (FLOAT)
+        - `operational` (BOOLEAN)
+    - Traversal usage:
+        - Used by longer-range routing algorithms and cheapest-route
+            heuristics that combine fare and time into a composite weight.
+    - Cypher example:
+        ```cypher
+        MATCH (x:NationalRailStation {station_id:$from}), (y:NationalRailStation {station_id:$to})
+        MERGE (x)-[r:RAIL_LINK {service_id:$svc}]->(y)
+            SET r.travel_time_min = $t, r.fare_base = $fare
+        RETURN r
+        ```
+
+- `INTERCHANGE_TO`
+    - Purpose: Represents pedestrian interchange connections between a
+        `MetroStation` and a `NationalRailStation` (or vice-versa). These
+        edges model transfer penalty/time/cost.
+    - Key properties:
+        - `walk_time_min` (INTEGER)
+        - `transfer_penalty` (FLOAT) — additive penalty used in routing
+        - `is_accessible` (BOOLEAN)
+        - `operational` (BOOLEAN)
+    - Traversal usage:
+        - Used by multimodal routing to include transfer cost; considered
+            during interchange path searches and alternative route
+            generation.
+    - Cypher example:
+        ```cypher
+        MATCH (m:MetroStation {station_id:$metro}), (r:NationalRailStation {station_id:$rail})
+        MERGE (m)-[t:INTERCHANGE_TO]->(r)
+            SET t.walk_time_min = $walk, t.transfer_penalty = $penalty
+        RETURN t
+        ```
+
+---
+
+### Graph Architecture Decisions
+
+- Bidirectional edge design
+    - Decision: Persist logical bidirectional connectivity via two
+        directional relationships (A->B and B->A) rather than using
+        undirected semantics.
+    - Why: Neo4j indexes and traversal algorithms operate on directed
+        relationships; explicit twin edges make traversal rules,
+        permissions, and per-direction operational flags (e.g., one-way
+        maintenance) deterministic.
+
+- Weighted routing strategy
+    - Decision: Precompute and store a `weight` on each relationship.
+    - Why: Allows flexible composite weights (time, distance, fare,
+        transfer_penalty) and avoids recomputing expensive functions at
+        query-time. Enables fast Dijkstra/A* searches and k-shortest-paths
+        with APOC/graph algorithms.
+
+- Interchange routing design
+    - Decision: Model interchanges as explicit `INTERCHANGE_TO` edges
+        with transfer metadata instead of implicit node attributes.
+    - Why: Transfer time, accessibility, and penalty vary by pair and
+        influence route ranking; edges encode these transfer costs cleanly.
+
+- Disruption-aware routing
+    - Decision: Include `operational` flags and support runtime
+        filtering of edges/nodes to simulate outages.
+    - Why: Enables `WHERE r.operational = true` style constraints for
+        live-routing and delay-ripple analyses without changing graph
+        topology.
+
+- APOC traversal usage
+    - Decision: Prefer APOC procedures for complex traversals and
+        k-shortest-paths (e.g., `apoc.algo.kShortestPaths`, `apoc.path.expandConfig`).
+    - Why: APOC provides battle-tested traversal utilities, path
+        weighting, and path filtering that are more expressive than pure
+        Cypher for advanced routing needs.
+
+---
+
+### Graph Query Layer (`databases/graph/queries.py`)
+
+This subsection documents the implemented query functions and the
+expected traversal patterns. All functions must be read-only and return
+JSON-serializable Python dictionaries/lists.
+
+- `query_shortest_route(origin_id: str, destination_id: str, network: str = "auto") -> dict`
+    - Purpose: Return the fastest route between two stations (time
+        optimized), optionally auto-selecting the network(s) (metro, rail,
+        or multimodal).
+    - Routing logic: Use Dijkstra/A* style shortest-path using the
+        `weight` property set to travel time (plus transfer_penalty where
+        applicable). If `network='auto'` the query searches across both
+        `METRO_LINK` and `RAIL_LINK` edges plus `INTERCHANGE_TO`.
+    - APOC usage: `apoc.algo.dijkstra` or `apoc.path.expandConfig` with
+        `weightProperty:'weight'` for configurable pruning.
+    - Traversal strategy: Restrict traversal to nodes/edges where
+        `operational = true`; return structured path with segments,
+        cumulative time, and per-segment metadata.
+
+- `query_cheapest_route(origin_id: str, destination_id: str, network: str = "auto", fare_class: str = "standard") -> dict`
+    - Purpose: Find a route minimizing monetary cost for a given fare
+        class (may trade time for lower fare).
+    - Routing logic: Composite weight combining `fare_base` (for
+        rail edges), per-stop fare heuristics, and `travel_time_min` where
+        needed. Weights are normalized and combined into `weight` during
+        seeding; queries pick the `fare_class`-adjusted weight where
+        precomputed.
+    - APOC usage: `apoc.algo.kShortestPaths` or `apoc.path.expandConfig`
+        with custom `weightProperty` that reflects fare-aware weights.
+    - Traversal strategy: Multimodal traversal that penalizes transfers
+        more heavily when fare class has transfer penalties; returns fare
+        breakdown and time tradeoffs.
+
+- `query_alternative_routes(origin_id, destination_id, avoid_station_id, network="auto", max_routes=3) -> list[list[dict]]`
+    - Purpose: Generate alternative viable routes avoiding a given
+        station (e.g., due to disruption) or providing k diverse
+        alternatives.
+    - Routing logic: Use k-shortest-paths with exclusion rules
+        (e.g., `WHERE NOT (n.station_id = $avoid_station_id)`) and
+        diversity heuristics (node/edge overlap penalty).
+    - APOC usage: `apoc.algo.kShortestPaths` + `apoc.path.subgraphNodes`
+        for candidate filtering.
+    - Traversal strategy: Ensure alternatives differ by at least one
+        major interchange or line; return route metadata for UI ranking.
+
+- `query_interchange_path(origin_id: str, destination_id: str) -> dict`
+    - Purpose: Explicitly compute the interchange portion(s) of a
+        multimodal journey (where transfers occur and transfer penalties).
+    - Routing logic: Isolate paths that include `INTERCHANGE_TO` edges,
+        compute per-transfer walk_time and accessibility flags.
+    - APOC usage: `apoc.path.expandConfig` with relationshipFilter
+        including `INTERCHANGE_TO` to enumerate transfer possibilities.
+    - Traversal strategy: Return ordered transfer steps with station
+        pairs, walk_time, and recommended routing (e.g., avoid inaccessible
+        transfers when `needs_accessible=true`).
+
+- `query_delay_ripple(delayed_station_id: str, hops: int = 2) -> list[dict]`
+    - Purpose: Find stations and services likely affected within N hops
+        of a delayed station (for operational impact analysis).
+    - Routing logic: Breadth-first traversal up to `hops` across
+        `METRO_LINK` and `RAIL_LINK`, considering schedules and service
+        frequencies in heuristics; weight by likely ripple severity.
+    - APOC usage: `apoc.path.subgraphNodes` or `apoc.path.expand` with
+        `minLevel`/`maxLevel` to bound hops and then aggregate.
+    - Traversal strategy: Filter to `operational=true` edges but mark
+        those that would be impacted because they share services with the
+        delayed station; return severity score per node.
+
+- `query_station_connections(station_id: str) -> list[dict]`
+    - Purpose: Return immediate neighbors and interchange options for a
+        station — used by UIs for station detail pages and predictive
+        transfer suggestions.
+    - Routing logic: One-hop traversal collecting outgoing and incoming
+        edges grouped by relationship type; include `distance_m`,
+        `travel_time_min`, and `operational` flags.
+    - APOC usage: Minimal — pure Cypher `MATCH (s {station_id:$id})-[r]->(n)`
+        is sufficient; APOC used for convenience helpers when expanding
+        repeated properties.
+    - Traversal strategy: Read-only, return list of connection dicts.
+
+---
+
+### Neo4j Query Conventions
+
+- Use the `_driver()` helper in `databases/graph/__init__.py` for all
+    driver/session management to centralize auth and connection configs.
+- Return JSON-serializable outputs: `list[dict]` or `dict` composed of
+    primitives (no raw Neo4j Record objects). Example return:
+    ```py
+    return {
+            "path": [ {"station_id": "S1", "name": "..."}, ... ],
+            "total_time_min": 12,
+            "total_fare": 3.20
+    }
+    ```
+- Read-only query philosophy: All `queries.py` functions must never
+    mutate graph state; seeding and schema changes are managed by
+    `skeleton/seed_neo4j.py`.
+- Disruption-aware traversal: Always include optional `operational`
+    filters in traversal patterns; expose boolean flags to the caller to
+    include/exclude non-operational elements.
+- Structured return dictionaries: Provide `meta` and `segments`
+    sections to make responses predictable for UIs and downstream AI
+    processors (e.g., `{"meta": {...}, "segments": [...]}`).
+- APOC traversal preference: For k-shortest or complex path
+    constraints prefer APOC procedures for performance and clarity.
+
+---
+
+### Seeding Conventions (`skeleton/seed_neo4j.py`)
+
+- Use `MERGE` instead of `CREATE` to allow idempotent runs of the seed
+    script and safe re-seeding during development.
+- Ensure uniqueness constraints exist (created once):
+    ```cypher
+    CREATE CONSTRAINT IF NOT EXISTS ON (m:MetroStation) ASSERT m.station_id IS UNIQUE;
+    CREATE CONSTRAINT IF NOT EXISTS ON (r:NationalRailStation) ASSERT r.station_id IS UNIQUE;
+    ```
+- Bidirectional relationships: When modeling bidirectional
+    connectivity, create twin edges `()-[:METRO_LINK]->()` and
+    `()-[:METRO_LINK]->()` in the opposite direction so per-direction
+    metadata (e.g., `operational`) can diverge if needed.
+- Precomputed routing weights: Compute `weight` at seed time using a
+    deterministic formula (e.g., `weight = travel_time_min + transfer_penalty * 60 * penalty_factor + fare_component`) and store it
+    on the relationship to accelerate queries.
+- Schema alignment: Keep property names and semantics aligned between
+    `seed_neo4j.py` and `databases/graph/queries.py` (e.g., `travel_time_min`,
+    `weight`, `operational`, `walk_time_min`) to avoid runtime mapping
+    errors.
+
+---
+
+### Neo4j Design Philosophy
+
+- The graph database is primarily optimized for traversal and
+    operations that benefit from graph topology and path-centric
+    reasoning. Core use cases include:
+    - Shortest-path traversal (time-optimized routing)
+    - Cheapest-route analysis (fare-aware routing)
+    - Multimodal routing (metro + national rail + interchanges)
+    - Interchange traversal with transfer penalties and accessibility
+        metadata
+    - Disruption simulation and delay ripple analysis
+    - AI-assisted route planning where path metadata is fed to models
+
+- Practical constraints:
+    - Keep node schemas small and push expensive attributes (e.g.,
+        full schedules) to relational tables. Use the graph for topology
+        and precomputed routing weights only.
+    - Favor read-only query functions in `databases/graph/queries.py` and
+        perform writes only through dedicated seed/migration scripts.
+
+---
+
+Please extend this section only with additional agreed-on labels or
+relationship types. Do not modify relational schema sections above or
+existing team decisions recorded in the file.
 
 ## Function Signatures We Are Implementing
 

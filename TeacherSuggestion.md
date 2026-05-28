@@ -102,3 +102,9 @@ Pipeline資料的正規化是
 id	title	embedding	keywords	category
 1	xxx	[vector 1]	["refund", "ticket", "delay"]	["ticketing"]
 2	yyy	[vector 2]	["ticket", "booking", "cancel"]	["ticketing"]
+
+
+正常轉站時應該會有轉站時的時間才合理 但我不知道是要設定成幾分鐘?文件上面好像沒有寫???
+文件上沒有寫。
+以台北捷運為例(https://www.metro.taipei/cp.aspx?n=ECEADC266D7120A7)，系統僅有乘車時間和預估的步行時間，候車時間沒有計算在內。
+大多的捷運系統也是如此，因為捷運不像火車或飛機有既定的時刻表，捷運經常會隨著情況、行事曆、非預期狀況等調整班次，所以你可以自己設一個合理的轉站時間即可。
