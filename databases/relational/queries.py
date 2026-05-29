@@ -278,8 +278,8 @@ def execute_cancellation(booking_id: str, user_id: str) -> tuple[bool, dict | st
 def register_user(
     email: str,
     first_name: str,
-    surname: str,
-    year_of_birth: int,
+    last_name: str,
+    date_of_birth: str,
     password: str,
     secret_question: str,
     secret_answer: str,
@@ -320,8 +320,8 @@ def register_user(
                     user_id,
                     email,
                     first_name,
-                    surname,
-                    year_of_birth
+                    last_name,
+                    date_of_birth
                 )
                 VALUES (%s, %s, %s, %s, %s)
                 """,
@@ -329,8 +329,8 @@ def register_user(
                     user_id,
                     email,
                     first_name,
-                    surname,
-                    year_of_birth
+                    last_name,
+                    date_of_birth
                 )
             )
 
@@ -410,9 +410,12 @@ def get_user_secret_question(email: str) -> Optional[str]:
 
             cur.execute(
                 """
-                SELECT secret_question
-                FROM users
-                WHERE email = %s
+                SELECT uc.secret_question
+                FROM users u
+                JOIN user_credentials uc ON u.user_id = uc.user_id
+                WHERE LOWER(u.email) = LOWER(%s)
+                AND u.deleted_at IS NULL
+                AND uc.deleted_at IS NULL
                 """,
                 (email,)
             )

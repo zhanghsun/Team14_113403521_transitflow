@@ -335,15 +335,23 @@ def query_station_connections(station_id: str) -> list[dict]: ...
 - Secret answer verification: Same `ph.verify()` pattern
 - User credentials table: `user_id` (FK to users), `password_hash`, `secret_question`, `secret_answer_hash`, `deleted_at`
 
-### Phase 2+ (Coming) — NOT STARTED
+### Phase 2 (seed_postgres.py) — ✅ COMPLETED
 
-- [ ] `seed_metro_schedules()` — JSONB decomposition of `stops_in_order[]`
-- [ ] `seed_national_rail_schedules()` — JSONB `fare_classes` dict parsing
-- [ ] `seed_seat_layouts()` — Decompose `coaches[]` into separate rows
-- [ ] `seed_national_rail_bookings()` — FK lookup of `layout_id`
-- [ ] `seed_metro_travels()` — `day_pass_ref` self-reference handling (UPDATE after INSERT)
-- [ ] `seed_payments()` — Parse BK/MT reference type prefixes
-- [ ] `seed_feedback()` — Parse BK/MT reference type prefixes
+**Branch:** `zhanghsun/seed-complex`
+
+- [x] `seed_metro_schedules()` — `stops_in_order`, `travel_time_from_origin_min`, `operates_on` stored as JSONB
+- [x] `seed_national_rail_schedules()` — `fare_classes` stored as JSONB; `passed_through_stations` = NULL (not in source data)
+- [x] `seed_seat_layouts()` — `coaches` array stored as JSONB blob
+- [x] `seed_national_rail_bookings()` — direct column mapping, 20 records
+- [x] `seed_metro_travels()` — `day_pass_ref` and `stops_travelled` nullable via `.get()`
+- [x] `seed_payments()` — FK routed by prefix: `BK*` → `national_rail_booking_id`, `MT*` → `metro_trip_id`
+- [x] `seed_feedback()` — same FK prefix routing as payments
+
+**Known limitation:** `national_rail_seat_layouts` only covers `NR_SCH01–04`. `NR_SCH05–08` have no seat layout data — `query_available_seats()` will return `[]` for those schedules.
+
+**Bug fixes applied to KC's queries.py (branch `kc/queries-profile`):**
+- `register_user()`: corrected column names `surname` → `last_name`, `year_of_birth` → `date_of_birth`
+- `get_user_secret_question()`: added JOIN to `user_credentials` (was incorrectly querying `users` table which has no `secret_question` column)
 
 
 ## Prompts That Worked

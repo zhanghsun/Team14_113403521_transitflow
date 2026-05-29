@@ -107,8 +107,8 @@ Reason:
 
 | Function                   | Notes                       |
 | -------------------------- | --------------------------- |
-| get_user_secret_question() | may require JOIN refinement |
-| query_user_bookings()      | waiting for Phase 2 tables  |
+| get_user_secret_question() | ✅ Fixed — JOIN to user_credentials added |
+| query_user_bookings()      | waiting for KC Phase 2 implementation |
 
 ---
 
@@ -257,9 +257,9 @@ Purpose:
 | ----------------------- | -------------- | ------------------ |
 | main                    | Team           | 🔄 integration     |
 | zhanghsun/seed-basic    | Zhang Hsun     | ✅ completed        |
-| kc/queries-profile      | KC             | ✅ mostly completed |
-| zhanghsun/seed-complex  | Zhang Hsun     | 🔄 in progress     |
-| kc/queries-availability | KC             | ⏳ waiting          |
+| kc/queries-profile      | KC             | ✅ completed (bugs fixed) |
+| zhanghsun/seed-complex  | Zhang Hsun     | ✅ completed        |
+| kc/queries-availability | KC             | 🟡 ready to start  |
 | kc/queries-booking      | KC             | ⏳ waiting          |
 | jingyuan/graph-neo4j    | Graph teammate | 🔄 parallel        |
 
@@ -275,13 +275,15 @@ Purpose:
 
 ### Tasks
 
-* seed_metro_schedules()
-* seed_national_rail_schedules()
-* seed_seat_layouts()
-* seed_national_rail_bookings()
-* seed_metro_travels()
-* seed_payments()
-* seed_feedback()
+* ✅ seed_metro_schedules()
+* ✅ seed_national_rail_schedules()
+* ✅ seed_seat_layouts()
+* ✅ seed_national_rail_bookings()
+* ✅ seed_metro_travels()
+* ✅ seed_payments()
+* ✅ seed_feedback()
+
+**Note:** `national_rail_seat_layouts` only covers NR_SCH01–04. NR_SCH05–08 have no seat layout in mock data.
 
 ---
 
