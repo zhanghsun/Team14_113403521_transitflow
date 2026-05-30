@@ -481,13 +481,93 @@ def query_user_bookings(user_email: str) -> dict:
     Returns:
         dict with keys 'national_rail' (list) and 'metro' (list)
     """
-    raise NotImplementedError("TODO: implement after designing your schema")
 
+    with _connect() as conn:
+        with conn.cursor(
+            cursor_factory=psycopg2.extras.RealDictCursor
+        ) as cur:
+
+            cur.execute(
+                """
+                SELECT user_id
+                FROM users
+                WHERE LOWER(email) = LOWER(%s)
+                AND deleted_at IS NULL
+                """,
+                (user_email,)
+            )
+
+            user = cur.fetchone()
+
+            if not user:
+                return {
+                    "national_rail": [],
+                    "metro": []
+                }
+
+            user_id = user["user_id"]
+
+            cur.execute(
+                """
+                SELECT *
+                FROM national_rail_bookings
+                WHERE user_id = %s
+                AND deleted_at IS NULL
+                ORDER BY booked_at DESC
+                """,
+                (user_id,)
+            )
+
+            national_rail = [
+                dict(row)
+                for row in cur.fetchall()
+            ]
+
+            cur.execute(
+                """
+                SELECT *
+                FROM metro_trips
+                WHERE user_id = %s
+                AND deleted_at IS NULL
+                ORDER BY purchased_at DESC
+                """,
+                (user_id,)
+            )
+
+            metro = [
+                dict(row)
+                for row in cur.fetchall()
+            ]
+
+            return {
+                "national_rail": national_rail,
+                "metro": metro
+            }
 
 def query_payment_info(booking_id: str) -> Optional[dict]:
     """Return payment record for a booking or metro trip."""
-    raise NotImplementedError("TODO: implement after designing your schema")
 
+    with _connect() as conn:
+        with conn.cursor(
+            cursor_factory=psycopg2.extras.RealDictCursor
+        ) as cur:
+
+            cur.execute(
+                """
+                SELECT *
+                FROM payments
+                WHERE national_rail_booking_id = %s
+                AND deleted_at IS NULL
+                """,
+                (booking_id,)
+            )
+
+            payment = cur.fetchone()
+
+            if not payment:
+                return None
+
+            return dict(payment)
 
 # ── TRANSACTIONAL OPERATIONS ──────────────────────────────────────────────────
 
@@ -501,44 +581,194 @@ def execute_booking(
     seat_id: str,
     ticket_type: str = "single",
 ) -> tuple[bool, dict | str]:
-    """
-    Create a national rail booking for a logged-in user.
 
-    Args:
-        user_id:                e.g. "RU01" — must match the logged-in user
-        schedule_id:            e.g. "NR_SCH01"
-        origin_station_id:      e.g. "NR01"
-        destination_station_id: e.g. "NR05"
-        travel_date:            e.g. "2025-06-01"
-        fare_class:             "standard" or "first"
-        seat_id:                e.g. "B05" (or "any" to auto-assign)
-        ticket_type:            "single" (default) or "return"
+    with _connect() as conn:
+        with conn.cursor(
+            cursor_factory=psycopg2.extras.RealDictCursor
+        ) as cur:
 
-    Returns:
-        (True, booking_dict)   on success
-        (False, error_message) on failure
-    """
-    raise NotImplementedError("TODO: implement after designing your schema")
+            cur.execute(
+                """
+                SELECT *
+                FROM national_rail_schedules
+                WHERE schedule_id = %s
+                AND deleted_at IS NULL
+                """,
+                (schedule_id,)
+            )
+
+            schedule = cur.fetchone()
+
+            if not schedule:
+                return (False, "Schedule not found")
+
+            stops = schedule["stops_in_order"]
+
+            if (
+                origin_station_id not in stops
+                or destination_station_id not in stops
+            ):
+                return (False, "Invalid stations")
+
+            origin_pos = stops.index(origin_station_id)
+            destination_pos = stops.index(destination_station_id)
+
+            if origin_pos >= destination_pos:
+                return (False, "Invalid travel direction")
+
+            stops_travelled = destination_pos - origin_pos
+            
+            fare_info = query_national_rail_fare(
+                schedule_id,
+                fare_class,
+                stops_travelled
+            )
+
+            if not fare_info:
+                return (False, "Fare not found")
+
+            amount_usd = fare_info["total_fare_usd"]
+            
+            available_seats = query_available_seats(
+                schedule_id,
+                travel_date,
+                fare_class
+            )
+
+            if not available_seats:
+                return (False, "No available seats")
+                            
+            selected_seat = None
+            
+            if seat_id == "any":
+    
+                selected = auto_select_adjacent_seats(
+                    available_seats,
+                    1
+                )
+
+                if not selected:
+                    return (False, "No available seats")
+
+                seat_id = selected[0]
 
 
-def execute_cancellation(booking_id: str, user_id: str) -> tuple[bool, dict | str]:
-    """
-    Cancel a national rail booking owned by the given user.
+            for seat in available_seats:
 
-    Calculates the refund amount according to the booking's service type:
-      - Normal service: RF001 windows (100% / 75% / 50% / 0%)
-      - Express service: RF002 windows (100% / 50% / 0%)
+                if seat["seat_id"] == seat_id:
+                    selected_seat = seat
+                    break
 
-    Args:
-        booking_id: e.g. "BK001"
-        user_id:    must match the booking's user_id
+            if not selected_seat:
+                return (False, "Seat not available")
 
-    Returns:
-        (True, result_dict)  with refund_amount_usd and policy note
-        (False, error_msg)
-    """
-    raise NotImplementedError("TODO: implement after designing your schema")
+            coach = selected_seat["coach"]
+            
+            booking_id = _gen_booking_id()
 
+            cur.execute(
+                """
+                INSERT INTO national_rail_bookings (
+                    booking_id,
+                    user_id,
+                    schedule_id,
+                    origin_station_id,
+                    destination_station_id,
+                    travel_date,
+                    ticket_type,
+                    fare_class,
+                    coach,
+                    seat_id,
+                    stops_travelled,
+                    amount_usd,
+                    status,
+                    booked_at
+                )
+                VALUES (
+                    %s, %s, %s, %s, %s,
+                    %s, %s, %s, %s, %s,
+                    %s, %s, %s, NOW()
+                )
+                """,
+                (
+                    booking_id,
+                    user_id,
+                    schedule_id,
+                    origin_station_id,
+                    destination_station_id,
+                    travel_date,
+                    ticket_type,
+                    fare_class,
+                    coach,
+                    seat_id,
+                    stops_travelled,
+                    amount_usd,
+                    "confirmed"
+                )
+            )
+
+
+def execute_cancellation(
+    booking_id: str,
+    user_id: str
+) -> tuple[bool, dict | str]:
+
+    with _connect() as conn:
+        with conn.cursor(
+            cursor_factory=psycopg2.extras.RealDictCursor
+        ) as cur:
+
+            cur.execute(
+                """
+                SELECT *
+                FROM national_rail_bookings
+                WHERE booking_id = %s
+                AND deleted_at IS NULL
+                """,
+                (booking_id,)
+            )
+
+            booking = cur.fetchone()
+
+            if not booking:
+                return (False, "Booking not found")
+
+            if booking["user_id"] != user_id:
+                return (False, "Unauthorized")
+
+            if booking["status"] == "cancelled":
+                return (False, "Booking already cancelled")
+
+            refund_amount = booking["amount_usd"]
+
+            cur.execute(
+                """
+                UPDATE national_rail_bookings
+                SET status = 'cancelled'
+                WHERE booking_id = %s
+                """,
+                (booking_id,)
+            )
+            cur.execute(
+                """
+                UPDATE payments
+                SET status = 'refunded'
+                WHERE national_rail_booking_id = %s
+                AND deleted_at IS NULL
+                """,
+                (booking_id,)
+            )
+            
+            conn.commit()
+            
+            return (
+                True,
+                {
+                    "booking_id": booking_id,
+                    "refund_amount_usd": refund_amount,
+                    "status": "cancelled"
+                }
+            )
 
 # ── AUTHENTICATION QUERIES ────────────────────────────────────────────────────
 
