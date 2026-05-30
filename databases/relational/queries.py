@@ -598,6 +598,8 @@ def execute_booking(
             )
 
             schedule = cur.fetchone()
+            
+            departure_time = schedule["first_train_time"]
 
             if not schedule:
                 return (False, "Schedule not found")
@@ -675,6 +677,7 @@ def execute_booking(
                     origin_station_id,
                     destination_station_id,
                     travel_date,
+                    departure_time,
                     ticket_type,
                     fare_class,
                     coach,
@@ -683,11 +686,11 @@ def execute_booking(
                     amount_usd,
                     status,
                     booked_at
-                )
+)
                 VALUES (
                     %s, %s, %s, %s, %s,
                     %s, %s, %s, %s, %s,
-                    %s, %s, %s, NOW()
+                    %s, %s, %s, %s, NOW()
                 )
                 """,
                 (
@@ -697,6 +700,7 @@ def execute_booking(
                     origin_station_id,
                     destination_station_id,
                     travel_date,
+                    departure_time,
                     ticket_type,
                     fare_class,
                     coach,
