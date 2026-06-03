@@ -1,74 +1,83 @@
-# Phase 1 Code Improvements — Team Handoff & Development Guide
+# IMPROVEMENTS.md
 
-**Date:** 2025-05-27
+**Date:** 2026-06-01
 **Project:** TransitFlow
-**Primary Branch:** `zhanghsun/seed-basic`
-**Current Status:** ✅ Completed & Tested
-**Related Branch:** `kc/queries-profile` ✅ Mostly Completed
+**Status:** Core System Completed & Integrated
 
 ---
 
-## Summary of Improvements
+# Project Progress Summary
 
-Enhanced `skeleton/seed_postgres.py` and related authentication architecture for:
+TransitFlow has completed the core implementation of:
 
-* code clarity
-* maintainability
-* production-style authentication
-* team handoff preparation
-* future Phase 2 integration
+* PostgreSQL relational database
+* Neo4j graph database
+* Authentication system
+* Booking and cancellation workflows
+* Payment and refund workflows
+* AI tool calling integration
+* Gradio user interface
 
-This document should be reviewed before continuing development.
-
----
-
-## 1. ✅ Added Helper Functions
-
-### `split_full_name(full_name: str) -> tuple[str, str]`
-
-* Extracts `first_name` and `last_name` from full name string
-* Example: `"Alice Tan"` → `("Alice", "Tan")`
-* Used in `seed_users()` for name decomposition
-
-### `hash_secret(value: str | None) -> str | None`
-
-* Hashes sensitive strings with **argon2id** (NOT MD5/SHA)
-* Embeds salt in MCF format — no separate salt column needed
-* Used for:
-
-  * passwords
-  * secret answers
-* Returns `None` if input is `None`
+All major Phase 1 and Phase 2 components have been implemented and tested.
 
 ---
 
-## 2. ✅ Improved `seed_users()` Function
+# 1. Authentication System Improvements
 
-### Changes
+## Added Helper Functions
 
-* Uses `split_full_name()` and `hash_secret()`
-* Added email normalization (`.lower()`)
-* Better variable naming
-* Separate loops for:
+### split_full_name(full_name)
 
-  * user_rows
-  * credential_rows
-* Added detailed security notes for KC
+Purpose:
 
-### Authentication Architecture
+* Split full names into first and last names
+* Used during user seeding
 
-Authentication is now split into:
+Example:
 
-#### `users`
+```python
+"Alice Tan"
+→ ("Alice", "Tan")
+```
+
+---
+
+### hash_secret(value)
+
+Purpose:
+
+* Securely hash sensitive information
+* Uses Argon2id
+
+Applied to:
+
+* Passwords
+* Secret answers
+
+Returns:
+
+```python
+None
+```
+
+when input is missing.
+
+---
+
+## Authentication Architecture
+
+Authentication data is separated into two tables.
+
+### users
 
 Stores:
 
-* user profile
+* profile information
 * email
 * phone
 * birth date
 
-#### `user_credentials`
+### user_credentials
 
 Stores:
 
@@ -76,305 +85,425 @@ Stores:
 * secret_question
 * secret_answer_hash
 
-### Why This Design?
-
-Reason:
+Benefits:
 
 * credential isolation
 * improved security
-* production-style architecture
-* easier future maintenance
+* easier maintenance
+* production-style design
 
 ---
 
-## 3. ✅ KC Completed Authentication Query Refactor
+# 2. Password Security Improvements
 
-### Branch
+## Argon2id Implementation
 
-`kc/queries-profile`
+Passwords are never stored in plaintext.
 
-### Completed Functions
+Example format:
 
-| Function               | Status |
-| ---------------------- | ------ |
-| register_user()        | ✅      |
-| login_user()           | ✅      |
-| verify_secret_answer() | ✅      |
-| update_password()      | ✅      |
-| query_user_profile()   | ✅      |
-
-### Partially Pending
-
-| Function                   | Notes                       |
-| -------------------------- | --------------------------- |
-| get_user_secret_question() | ✅ Fixed — JOIN to user_credentials added |
-| query_user_bookings()      | waiting for KC Phase 2 implementation |
-
----
-
-## 4. ✅ Argon2id Security Rules
-
-### IMPORTANT SECURITY NOTES
-
-```python
-from argon2 import PasswordHasher
-
-ph = PasswordHasher()
-
-# Hashing
-password_hash = ph.hash(password)
-
-# Verification
-try:
-    ph.verify(db_password_hash, input_password)
-except:
-    # invalid password
+```text
+$argon2id$v=19$m=65536,t=3,p=4$...
 ```
 
-### Important Notes
+Verification performed using:
 
-* Passwords are NEVER stored in plaintext
-* Secret answers are ALSO hashed
-* Salt is EMBEDDED in argon2id MCF format
-* No separate salt column is required
+```python
+ph.verify(stored_hash, input_password)
+```
 
 ---
 
-## 5. ✅ Email Normalization
+## Security Rules
 
-### Insert Rule
+Implemented:
+
+* password hashing
+* secret answer hashing
+* embedded salt storage
+* password verification
+
+Not implemented:
+
+* plaintext password storage
+
+Verification completed through PostgreSQL inspection.
+
+Result:
+
+✅ Passwords hashed
+
+✅ Secret answers hashed
+
+---
+
+# 3. Email Normalization
+
+Insert Rule:
 
 ```python
 email.lower()
 ```
 
-### Query Rule
+Query Rule:
 
 ```sql
 LOWER(email)
 ```
 
-### Reason
+Benefits:
 
-Avoid:
-
-* duplicate accounts
-* casing inconsistency
+* avoids duplicate accounts
+* avoids casing inconsistencies
 
 Example:
 
-* `ABC@gmail.com`
-* `abc@gmail.com`
+```text
+ABC@gmail.com
+abc@gmail.com
+```
 
-should be treated as the same account.
+treated as identical users.
 
 ---
 
-## 6. ✅ Soft Delete Architecture
+# 4. Soft Delete Architecture
 
-Tables use:
+Tables support:
 
 ```sql
 deleted_at TIMESTAMP
 ```
 
-### Rule
+Rules:
 
-* `deleted_at IS NULL` → active
-* `deleted_at IS NOT NULL` → archived/logically deleted
-
-### Future Query Rule
-
-Most future queries should include:
-
-```sql
-AND deleted_at IS NULL
+```text
+deleted_at IS NULL
 ```
 
-unless intentionally querying archived data.
+→ active record
 
----
-
-## 7. ✅ Added Code Organization Comments
-
-Examples:
-
-```python
-# ── helper functions ─────────────────────────────
-# ── data loading & connection ────────────────────
+```text
+deleted_at IS NOT NULL
 ```
 
-Purpose:
+→ archived record
 
-* improve readability
-* faster teammate navigation
-* easier debugging
+Most queries automatically exclude deleted records.
 
 ---
 
-## Verification Results
+# 5. PostgreSQL Seed Improvements
 
-| Check                             | Result |
-| --------------------------------- | ------ |
-| Syntax validation                 | ✅ Pass |
-| Helper functions work             | ✅ Pass |
-| `split_full_name()` decomposition | ✅ Pass |
-| Argon2id hash format correct      | ✅ Pass |
-| Email normalization               | ✅ Pass |
-| Phase 1 seeding still works       | ✅ Pass |
-| ON CONFLICT DO NOTHING idempotent | ✅ Pass |
-| 20 users seeded                   | ✅ Pass |
-| 20 credentials seeded             | ✅ Pass |
+Completed seeding for:
 
----
-
-## Current Database Status
-
-### ✅ Ready Tables
+## Metro
 
 * metro_stations
 * metro_station_lines
+* metro_schedules
+* metro_trips
+
+## National Rail
+
 * national_rail_stations
 * national_rail_station_lines
+* national_rail_schedules
+* national_rail_seat_layouts
+* national_rail_bookings
+
+## User System
+
 * users
 * user_credentials
 
-### ⏳ Pending Phase 2 Tables
+## Payments
 
-* metro_schedules
-* national_rail_schedules
-* national_rail_bookings
-* metro_trips
 * payments
+
+## Feedback
+
 * feedback
-* seat_layouts
 
 ---
 
-## Current Team Progress
+# 6. Query Layer Implementation
 
-| Branch                  | Owner          | Status             |
-| ----------------------- | -------------- | ------------------ |
-| main                    | Team           | 🔄 integration     |
-| zhanghsun/seed-basic    | Zhang Hsun     | ✅ completed        |
-| kc/queries-profile      | KC             | ✅ completed (bugs fixed) |
-| zhanghsun/seed-complex  | Zhang Hsun     | ✅ completed        |
-| kc/queries-availability | KC             | 🟡 ready to start  |
-| kc/queries-booking      | KC             | ⏳ waiting          |
-| jingyuan/graph-neo4j    | Graph teammate | 🔄 parallel        |
+## Profile Queries
 
----
+Completed:
 
-## Next Steps
-
-### Zhang Hsun
-
-### Branch
-
-`zhanghsun/seed-complex`
-
-### Tasks
-
-* ✅ seed_metro_schedules()
-* ✅ seed_national_rail_schedules()
-* ✅ seed_seat_layouts()
-* ✅ seed_national_rail_bookings()
-* ✅ seed_metro_travels()
-* ✅ seed_payments()
-* ✅ seed_feedback()
-
-**Note:** `national_rail_seat_layouts` only covers NR_SCH01–04. NR_SCH05–08 have no seat layout in mock data.
-
----
-
-### KC
-
-### Branch
-
-`kc/queries-availability`
-
-### Tasks
-
-* query_metro_schedules()
-* query_national_rail_schedules()
-* query_available_seats()
-* query_national_rail_fare()
-* query_metro_fare()
-
-### Dependency Warning
-
-⚠️ Wait until Phase 2 seeding/schema stabilizes before implementing JOIN-heavy queries.
-
----
-
-## Current Architecture Discussion
-
-### Seat Availability Design
-
-Discussion topic:
-
-> Should available seats be dynamically calculated or stored in an occupancy table?
-
-Still under evaluation.
-
-Possible considerations:
-
-* query complexity
-* consistency
-* redundancy
-* scalability
-* performance
-
----
-
-## Recommended Workflow Before Starting Work
-
-Always run:
-
-```bash
-git fetch origin
-git merge origin/<teammate-branch>
+```python
+query_user_profile()
+query_user_bookings()
+query_payment_info()
 ```
 
-before continuing development.
+Capabilities:
 
-Avoid directly modifying:
+* retrieve profile information
+* retrieve booking history
+* retrieve payment information
 
-```bash
+---
+
+## Availability Queries
+
+Completed:
+
+```python
+query_national_rail_availability()
+query_national_rail_fare()
+query_available_seats()
+```
+
+Capabilities:
+
+* train availability lookup
+* fare calculation
+* seat availability calculation
+
+---
+
+# 7. Booking Workflow
+
+Implemented:
+
+```python
+execute_booking()
+```
+
+Features:
+
+* schedule validation
+* station validation
+* travel direction validation
+* fare calculation
+* seat assignment
+* booking creation
+* payment creation
+
+Supports:
+
+```text
+seat_id = "any"
+```
+
+automatic seat assignment.
+
+---
+
+## Booking Verification
+
+Successfully tested:
+
+* booking insertion
+* seat assignment
+* fare generation
+* payment generation
+
+Result:
+
+✅ Pass
+
+---
+
+# 8. Cancellation Workflow
+
+Implemented:
+
+```python
+execute_cancellation()
+```
+
+Features:
+
+* ownership validation
+* booking cancellation
+* refund generation
+* payment status update
+
+Booking status:
+
+```text
+confirmed
+→ cancelled
+```
+
+Payment status:
+
+```text
+paid
+→ refunded
+```
+
+Verification completed through PostgreSQL and pgAdmin.
+
+Result:
+
+✅ Pass
+
+---
+
+# 9. Payment System
+
+Implemented:
+
+* payment record creation
+* payment lookup
+* refund processing
+
+Functions:
+
+```python
+query_payment_info()
+```
+
+Integrated with booking and cancellation workflows.
+
+Verification:
+
+✅ Pass
+
+---
+
+# 10. Neo4j Integration
+
+Graph database implementation completed.
+
+Branch:
+
+```text
+jingyuan/graph-neo4j
+```
+
+Merged into:
+
+```text
 main
 ```
 
-Use feature branches only.
+Capabilities:
+
+* shortest route search
+* route planning
+* transfer recommendations
+* alternative path discovery
+
+Status:
+
+✅ Completed!
 
 ---
 
-## Important Files to Review Before Working
+# 11. AI Tool Calling Integration
 
-| File                  | Purpose             |
-| --------------------- | ------------------- |
-| AI_SESSION_CONTEXT.md | architecture memory |
-| IMPROVEMENTS.md       | development history |
-| schema.sql            | relational schema   |
-| seed_postgres.py      | seeding logic       |
-| queries.py            | query layer         |
+Agent successfully connected to:
+
+## PostgreSQL Tools
+
+* profile queries
+* availability queries
+* booking functions
+* payment functions
+
+## Neo4j Tools
+
+* route planning
+* graph search
+
+Status:
+
+✅ Operational
 
 ---
 
-## Final Notes
+# 12. Gradio User Interface
 
-This project now includes:
+UI successfully launched through:
+
+```bash
+python skeleton/ui.py
+```
+
+Local endpoint:
+
+```text
+http://localhost:7860
+```
+
+Capabilities:
+
+* natural language queries
+* route planning
+* booking requests
+* policy retrieval
+
+Status:
+
+✅ Operational
+
+---
+
+# Verification Results
+
+| Check                  | Result |
+| ---------------------- | ------ |
+| PostgreSQL Seeding     | ✅ Pass |
+| User Authentication    | ✅ Pass |
+| Password Hashing       | ✅ Pass |
+| Email Normalization    | ✅ Pass |
+| Availability Queries   | ✅ Pass |
+| Fare Queries           | ✅ Pass |
+| Seat Availability      | ✅ Pass |
+| Booking Creation       | ✅ Pass |
+| Payment Creation       | ✅ Pass |
+| Cancellation Flow      | ✅ Pass |
+| Refund Processing      | ✅ Pass |
+| User Booking Retrieval | ✅ Pass |
+| pgAdmin Verification   | ✅ Pass |
+| Neo4j Integration      | ✅ Pass |
+| Tool Calling           | ✅ Pass |
+| Gradio UI              | ✅ Pass |
+
+---
+
+# Current Team Progress
+
+| Branch                  | Owner          | Status             |
+| ----------------------- | -------------- | ------------------ |
+| main                    | Team           | 🔄 Integration     |
+| zhanghsun/seed-basic    | Zhang Hsun     | ✅ Completed        |
+| zhanghsun/seed-complex  | Zhang Hsun     | ✅ Completed        |
+| kc/queries-profile      | KC             | ✅ Completed        |
+| kc/queries-availability | KC             | ✅ Completed        |
+| kc/queries-booking      | KC             | ✅ Completed        |
+| jingyuan/graph-neo4j    | Graph Teammate | ✅ Merged into Main |
+
+---
+
+# Remaining Work
+
+* Final integration testing
+* Design documentation
+* Work allocation documentation
+* TASK6 bonus features
+* Final acceptance testing
+
+---
+
+# Final Notes
+
+TransitFlow now includes:
 
 * PostgreSQL
 * Neo4j
-* authentication systems
-* AI tool calling
-* RAG/vector policy retrieval
-* multi-stage normalization
+* Authentication
+* Booking System
+* Payment System
+* Refund System
+* AI Tool Calling
+* RAG Policy Retrieval
+* Gradio Interface
 
-Future development should preserve:
-
-* argon2id authentication flow
-* deleted_at logic
-* email normalization
-* branch workflow
-* schema consistency
+Core functionality has been implemented and verified through both programmatic testing and database validation.
