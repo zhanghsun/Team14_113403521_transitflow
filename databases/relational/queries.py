@@ -459,7 +459,8 @@ def query_user_profile(user_email: str) -> Optional[dict]:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute(
                 """
-                SELECT *
+                SELECT *,
+                       first_name || ' ' || last_name AS full_name
                 FROM users
                 WHERE email = %s
                 """,
@@ -848,6 +849,10 @@ def register_user(
             # Generate user ID
             user_id = "RU" + ''.join(random.choices(string.digits, k=4))
 
+            # Normalise date_of_birth: the UI passes only a birth year (int/float/str).
+            # Always convert to "YYYY-01-01" so psycopg2 can bind it to DATE column.
+            date_of_birth = f"{str(date_of_birth).strip()[:4]}-01-01"
+
             # Hash sensitive data
             password_hash = ph.hash(password)
             secret_answer_hash = ph.hash(secret_answer)
@@ -907,7 +912,7 @@ def login_user(email: str, password: str) -> Optional[dict]:
                 SELECT
                     u.user_id,
                     u.first_name,
-                    u.last_name,
+                    u.last_name AS surname,
                     u.email,
                     u.phone,
                     u.date_of_birth,
