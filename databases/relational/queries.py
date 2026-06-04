@@ -1195,3 +1195,101 @@ def query_user_travel_history(user_email: str) -> list[dict]:
             )
 
             return history
+        
+# TASK 6 EXTENSION:
+# This function aggregates route usage statistics across
+# both national rail and metro systems.
+# The goal is to provide analytics data that can support
+# dashboards and operational planning.
+
+def query_route_statistics() -> dict:
+    """
+    Return route analytics.
+
+    Includes:
+    - top national rail routes
+    - top metro routes
+    - total bookings/trips
+    """
+
+    with _connect() as conn:
+        with conn.cursor(
+            cursor_factory=psycopg2.extras.RealDictCursor
+        ) as cur:
+
+            # Why:
+            # Aggregate rail bookings by origin-destination pair
+            # to identify the most frequently travelled routes.
+            cur.execute(
+                """
+                SELECT
+                    os.name AS origin,
+                    ds.name AS destination,
+                    COUNT(*) AS trip_count
+                FROM national_rail_bookings b
+                JOIN national_rail_stations os
+                    ON b.origin_station_id = os.station_id
+                JOIN national_rail_stations ds
+                    ON b.destination_station_id = ds.station_id
+                WHERE b.deleted_at IS NULL
+                GROUP BY os.name, ds.name
+                ORDER BY trip_count DESC
+                LIMIT 5
+                """
+            )
+
+            top_rail_routes = [
+                dict(row)
+                for row in cur.fetchall()
+            ]
+
+            # Why:
+            # Aggregate metro trips by route to identify
+            # the most popular metro journeys.
+            cur.execute(
+                """
+                SELECT
+                    os.name AS origin,
+                    ds.name AS destination,
+                    COUNT(*) AS trip_count
+                FROM metro_trips t
+                JOIN metro_stations os
+                    ON t.origin_station_id = os.station_id
+                JOIN metro_stations ds
+                    ON t.destination_station_id = ds.station_id
+                WHERE t.deleted_at IS NULL
+                GROUP BY os.name, ds.name
+                ORDER BY trip_count DESC
+                LIMIT 5
+                """
+            )
+
+            top_metro_routes = [
+                dict(row)
+                for row in cur.fetchall()
+            ]
+
+            cur.execute(
+                """
+                SELECT COUNT(*)
+                FROM national_rail_bookings
+                WHERE deleted_at IS NULL
+                """
+            )
+            total_rail = cur.fetchone()["count"]
+
+            cur.execute(
+                """
+                SELECT COUNT(*)
+                FROM metro_trips
+                WHERE deleted_at IS NULL
+                """
+            )
+            total_metro = cur.fetchone()["count"]
+
+            return {
+                "top_national_rail_routes": top_rail_routes,
+                "top_metro_routes": top_metro_routes,
+                "total_national_rail_bookings": total_rail,
+                "total_metro_trips": total_metro
+            }
