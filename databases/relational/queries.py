@@ -38,6 +38,9 @@ ph = PasswordHasher()
 from skeleton.config import PG_DSN, VECTOR_TOP_K, VECTOR_SIMILARITY_THRESHOLD
 
 
+# TASK 6 EXTENSION:
+# Travel History Dashboard and Route Statistics Analytics
+
 def _connect():
     """Return a new psycopg2 connection with autocommit enabled."""
     conn = psycopg2.connect(PG_DSN)
@@ -1083,3 +1086,250 @@ def store_policy_document(
         with conn.cursor() as cur:
             cur.execute(sql, (title, category, content, vec_str, source_file))
             return cur.fetchone()[0]
+
+
+# TASK 6 EXTENSION:
+# This function creates a unified travel-history view for a user.
+# National rail bookings and metro trips are stored in different tables.
+# We combine them into a single structure so future dashboard and analytics
+# features can display all journeys consistently.
+
+def query_user_travel_history(user_email: str) -> list[dict]:
+    """
+    Return a user's complete travel history.
+
+    Each record contains:
+    - trip_type
+    - record_id
+    - origin
+    - destination
+    - travel_date
+    - ticket_type
+    - amount_usd
+    - status
+    """
+
+    with _connect() as conn:
+        with conn.cursor(
+            cursor_factory=psycopg2.extras.RealDictCursor
+        ) as cur:
+
+            # Why:
+            # Convert email into the internal user_id once so that
+            # later queries remain simple and efficient.
+            cur.execute(
+                """
+                SELECT user_id
+                FROM users
+                WHERE LOWER(email) = LOWER(%s)
+                AND deleted_at IS NULL
+                """,
+                (user_email,)
+            )
+
+            user = cur.fetchone()
+
+            if not user:
+                return []
+
+            user_id = user["user_id"]
+
+            history = []
+
+            # Why:
+            # Retrieve national rail journeys and enrich them with
+            # human-readable station names so the travel-history
+            # dashboard is easier to understand.
+            cur.execute(
+                """
+                SELECT
+                    b.booking_id AS record_id,
+                    os.name AS origin,
+                    ds.name AS destination,
+                    b.travel_date,
+                    b.ticket_type,
+                    b.amount_usd,
+                    b.status
+                FROM national_rail_bookings b
+                JOIN national_rail_stations os
+                    ON b.origin_station_id = os.station_id
+                JOIN national_rail_stations ds
+                    ON b.destination_station_id = ds.station_id
+                WHERE b.user_id = %s
+                AND b.deleted_at IS NULL
+                """,
+                (user_id,)
+            )
+
+            for row in cur.fetchall():
+                history.append({
+                    "trip_type": "National Rail",
+                    "record_id": row["record_id"],
+                    "origin": row["origin"],
+                    "destination": row["destination"],
+                    "travel_date": row["travel_date"],
+                    "ticket_type": row["ticket_type"],
+                    "amount_usd": float(row["amount_usd"]),
+                    "status": row["status"]
+                })
+
+            # Why:
+            # Metro trips are stored separately from rail bookings.
+            # We transform them into the same structure so both transport
+            # modes can appear together in a unified dashboard.
+            cur.execute(
+                """
+                SELECT
+                    t.trip_id AS record_id,
+                    os.name AS origin,
+                    ds.name AS destination,
+                    t.travel_date,
+                    t.ticket_type,
+                    t.amount_usd,
+                    t.status
+                FROM metro_trips t
+                JOIN metro_stations os
+                    ON t.origin_station_id = os.station_id
+                JOIN metro_stations ds
+                    ON t.destination_station_id = ds.station_id
+                WHERE t.user_id = %s
+                AND t.deleted_at IS NULL
+                """,
+                (user_id,)
+            )
+
+            for row in cur.fetchall():
+                history.append({
+                    "trip_type": "Metro",
+                    "record_id": row["record_id"],
+                    "origin": row["origin"],
+                    "destination": row["destination"],
+                    "travel_date": row["travel_date"],
+                    "ticket_type": row["ticket_type"],
+                    "amount_usd": float(row["amount_usd"]),
+                    "status": row["status"]
+                })
+
+            history.sort(
+                key=lambda x: x["travel_date"],
+                reverse=True
+            )
+
+            return history
+        
+# TASK 6 EXTENSION:
+# This function aggregates route usage statistics across
+# both national rail and metro systems.
+# The goal is to provide analytics data that can support
+# dashboards, travel-pattern analysis, and operational planning.
+#
+# Unlike existing booking-history queries that focus on 
+# a single user, this function provides system-wide statistics
+# that reveal the most frequently travelled routes.
+
+def query_route_statistics() -> dict:
+    """
+    Return route analytics.
+
+    Includes:
+    - top national rail routes
+    - top metro routes
+    - total bookings/trips
+    """
+
+    with _connect() as conn:
+        with conn.cursor(
+            cursor_factory=psycopg2.extras.RealDictCursor
+        ) as cur:
+
+            # Why:
+            # Aggregate national rail bookings by origin-destination pair
+            # to identify the most frequently travelled routes.
+            # This information is not available through the existing
+            # booking-history functions and is intended for analytics
+            # dashboards and route popularity reporting.
+            cur.execute(
+                """
+                SELECT
+                    os.name AS origin,
+                    ds.name AS destination,
+                    COUNT(*) AS trip_count
+                FROM national_rail_bookings b
+                JOIN national_rail_stations os
+                    ON b.origin_station_id = os.station_id
+                JOIN national_rail_stations ds
+                    ON b.destination_station_id = ds.station_id
+                WHERE b.deleted_at IS NULL
+                GROUP BY os.name, ds.name
+                ORDER BY trip_count DESC
+                LIMIT 5
+                """
+            )
+
+            top_rail_routes = [
+                dict(row)
+                for row in cur.fetchall()
+            ]
+
+            # Why:
+            # Aggregate metro trips by route to identify the most
+            # frequently used metro journeys. Presenting station names
+            # instead of station IDs makes the analytics output easier
+            # for users and evaluators to interpret.
+            cur.execute(
+                """
+                SELECT
+                    os.name AS origin,
+                    ds.name AS destination,
+                    COUNT(*) AS trip_count
+                FROM metro_trips t
+                JOIN metro_stations os
+                    ON t.origin_station_id = os.station_id
+                JOIN metro_stations ds
+                    ON t.destination_station_id = ds.station_id
+                WHERE t.deleted_at IS NULL
+                GROUP BY os.name, ds.name
+                ORDER BY trip_count DESC
+                LIMIT 5
+                """
+            )
+
+            top_metro_routes = [
+                dict(row)
+                for row in cur.fetchall()
+            ]
+
+            # Why:
+            # Provide a high-level summary metric showing the overall
+            # volume of national rail bookings currently stored in the
+            # database. This supports dashboard-style reporting.
+            cur.execute(
+                """
+                SELECT COUNT(*)
+                FROM national_rail_bookings
+                WHERE deleted_at IS NULL
+                """
+            )
+
+            total_rail = cur.fetchone()["count"]
+
+            # Why:
+            # Provide a comparable metro usage metric so that dashboard
+            # users can quickly compare activity across the two transport
+            # systems without inspecting individual trip records.
+            cur.execute(
+                """
+                SELECT COUNT(*)
+                FROM metro_trips
+                WHERE deleted_at IS NULL
+                """
+            )
+
+            total_metro = cur.fetchone()["count"]
+
+            return {
+                "top_national_rail_routes": top_rail_routes,
+                "top_metro_routes": top_metro_routes,
+                "total_national_rail_bookings": total_rail,
+                "total_metro_trips": total_metro
+            }
