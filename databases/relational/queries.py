@@ -38,6 +38,9 @@ ph = PasswordHasher()
 from skeleton.config import PG_DSN, VECTOR_TOP_K, VECTOR_SIMILARITY_THRESHOLD
 
 
+# TASK 6 EXTENSION:
+# Travel History Dashboard and Route Statistics Analytics
+
 def _connect():
     """Return a new psycopg2 connection with autocommit enabled."""
     conn = psycopg2.connect(PG_DSN)
@@ -1083,3 +1086,112 @@ def store_policy_document(
         with conn.cursor() as cur:
             cur.execute(sql, (title, category, content, vec_str, source_file))
             return cur.fetchone()[0]
+
+# TASK 6 EXTENSION:
+# This function creates a unified travel-history view for a user.
+# National rail bookings and metro trips are stored in different tables.
+# We combine them into a single structure so future dashboard and analytics
+# features can display all journeys consistently.
+
+def query_user_travel_history(user_email: str) -> list[dict]:
+    """
+    Return a user's complete travel history.
+
+    Each record contains:
+    - trip_type
+    - record_id
+    - travel_date
+    - ticket_type
+    - amount_usd
+    - status
+    """
+
+    with _connect() as conn:
+        with conn.cursor(
+            cursor_factory=psycopg2.extras.RealDictCursor
+        ) as cur:
+
+            # Why:
+            # Convert email into the internal user_id once so that
+            # later queries remain simple and efficient.
+            cur.execute(
+                """
+                SELECT user_id
+                FROM users
+                WHERE LOWER(email) = LOWER(%s)
+                AND deleted_at IS NULL
+                """,
+                (user_email,)
+            )
+
+            user = cur.fetchone()
+
+            if not user:
+                return []
+
+            user_id = user["user_id"]
+
+            history = []
+
+            # Why:
+            # Retrieve national rail journeys and normalise them into
+            # a common dashboard format.
+            cur.execute(
+                """
+                SELECT
+                    booking_id,
+                    travel_date,
+                    ticket_type,
+                    amount_usd,
+                    status
+                FROM national_rail_bookings
+                WHERE user_id = %s
+                AND deleted_at IS NULL
+                """,
+                (user_id,)
+            )
+
+            for row in cur.fetchall():
+                history.append({
+                    "trip_type": "National Rail",
+                    "record_id": row["booking_id"],
+                    "travel_date": row["travel_date"],
+                    "ticket_type": row["ticket_type"],
+                    "amount_usd": float(row["amount_usd"]),
+                    "status": row["status"]
+                })
+
+            # Why:
+            # Metro trips use a different table but should appear in the
+            # same travel-history dashboard.
+            cur.execute(
+                """
+                SELECT
+                    trip_id,
+                    travel_date,
+                    ticket_type,
+                    amount_usd,
+                    status
+                FROM metro_trips
+                WHERE user_id = %s
+                AND deleted_at IS NULL
+                """,
+                (user_id,)
+            )
+
+            for row in cur.fetchall():
+                history.append({
+                    "trip_type": "Metro",
+                    "record_id": row["trip_id"],
+                    "travel_date": row["travel_date"],
+                    "ticket_type": row["ticket_type"],
+                    "amount_usd": float(row["amount_usd"]),
+                    "status": row["status"]
+                })
+
+            history.sort(
+                key=lambda x: x["travel_date"],
+                reverse=True
+            )
+
+            return history
