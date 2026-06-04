@@ -1101,6 +1101,8 @@ def query_user_travel_history(user_email: str) -> list[dict]:
     Each record contains:
     - trip_type
     - record_id
+    - origin
+    - destination
     - travel_date
     - ticket_type
     - amount_usd
@@ -1135,19 +1137,26 @@ def query_user_travel_history(user_email: str) -> list[dict]:
             history = []
 
             # Why:
-            # Retrieve national rail journeys and normalise them into
-            # a common dashboard format.
+            # Retrieve national rail journeys and enrich them with
+            # human-readable station names so the travel-history
+            # dashboard is easier to understand.
             cur.execute(
                 """
                 SELECT
-                    booking_id,
-                    travel_date,
-                    ticket_type,
-                    amount_usd,
-                    status
-                FROM national_rail_bookings
-                WHERE user_id = %s
-                AND deleted_at IS NULL
+                    b.booking_id AS record_id,
+                    os.name AS origin,
+                    ds.name AS destination,
+                    b.travel_date,
+                    b.ticket_type,
+                    b.amount_usd,
+                    b.status
+                FROM national_rail_bookings b
+                JOIN national_rail_stations os
+                    ON b.origin_station_id = os.station_id
+                JOIN national_rail_stations ds
+                    ON b.destination_station_id = ds.station_id
+                WHERE b.user_id = %s
+                AND b.deleted_at IS NULL
                 """,
                 (user_id,)
             )
@@ -1155,7 +1164,9 @@ def query_user_travel_history(user_email: str) -> list[dict]:
             for row in cur.fetchall():
                 history.append({
                     "trip_type": "National Rail",
-                    "record_id": row["booking_id"],
+                    "record_id": row["record_id"],
+                    "origin": row["origin"],
+                    "destination": row["destination"],
                     "travel_date": row["travel_date"],
                     "ticket_type": row["ticket_type"],
                     "amount_usd": float(row["amount_usd"]),
@@ -1163,19 +1174,26 @@ def query_user_travel_history(user_email: str) -> list[dict]:
                 })
 
             # Why:
-            # Metro trips use a different table but should appear in the
-            # same travel-history dashboard.
+            # Metro trips are stored separately from rail bookings.
+            # We transform them into the same structure so both transport
+            # modes can appear together in a unified dashboard.
             cur.execute(
                 """
                 SELECT
-                    trip_id,
-                    travel_date,
-                    ticket_type,
-                    amount_usd,
-                    status
-                FROM metro_trips
-                WHERE user_id = %s
-                AND deleted_at IS NULL
+                    t.trip_id AS record_id,
+                    os.name AS origin,
+                    ds.name AS destination,
+                    t.travel_date,
+                    t.ticket_type,
+                    t.amount_usd,
+                    t.status
+                FROM metro_trips t
+                JOIN metro_stations os
+                    ON t.origin_station_id = os.station_id
+                JOIN metro_stations ds
+                    ON t.destination_station_id = ds.station_id
+                WHERE t.user_id = %s
+                AND t.deleted_at IS NULL
                 """,
                 (user_id,)
             )
@@ -1183,7 +1201,9 @@ def query_user_travel_history(user_email: str) -> list[dict]:
             for row in cur.fetchall():
                 history.append({
                     "trip_type": "Metro",
-                    "record_id": row["trip_id"],
+                    "record_id": row["record_id"],
+                    "origin": row["origin"],
+                    "destination": row["destination"],
                     "travel_date": row["travel_date"],
                     "ticket_type": row["ticket_type"],
                     "amount_usd": float(row["amount_usd"]),
