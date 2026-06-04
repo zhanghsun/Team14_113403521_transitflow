@@ -1,3 +1,4 @@
+# TASK 6 EXTENSION: Graph query extension for reachable-stations analysis.
 """
 TransitFlow — Neo4j Graph Database Layer
 =========================================
@@ -844,6 +845,80 @@ def query_delay_ripple(delayed_station_id: str, hops: int = 2) -> list[dict]:
                         dedup[sid] = row
                 return sorted(dedup.values(), key=lambda x: (x["hops_away"], x["station_id"]))
             except (ServiceUnavailable, SessionExpired, Neo4jError):
+                return []
+
+
+# ── REACHABLE STATIONS WITHIN TIME BUDGET ────────────────────────────────────
+
+def query_reachable_stations(origin_id: str, max_time_min: int = 30) -> list[dict]:
+    """
+    Find all stations reachable from an origin within a travel-time budget.
+
+    Args:
+        origin_id:      e.g. "MS01" or "NR01"
+        max_time_min:   maximum cumulative travel time to include
+
+    Returns:
+        List of dicts: {station_id, name, total_time_min, hops_away, lines}
+    """
+    if max_time_min <= 0:
+        return []
+    # Hard-cap query radius so one bad prompt cannot trigger an expensive full-graph walk.
+    max_time_min = max(1, min(int(max_time_min), 240))
+
+    with _driver() as driver:
+        with driver.session() as session:
+            try:
+                if not _station_exists(session, origin_id):
+                    # Return a predictable empty list instead of raising; the agent layer
+                    # already knows how to explain "no data" responses to users.
+                    return []
+
+                records = session.run(
+                    f"""
+                    MATCH (start {{station_id: $origin_id}})
+                    WHERE {_station_labels_filter('start')}
+                      AND {_not_closed_expr('start')}
+                    // BFS enumerates candidate paths without mutating the graph, then we keep the fastest arrival for each station.
+                    CALL apoc.path.expandConfig(start, {{
+                        relationshipFilter: 'METRO_LINK|RAIL_LINK|INTERCHANGE_TO',
+                        minLevel: 1,
+                        maxLevel: 20,
+                        bfs: true,
+                        // NODE_PATH keeps alternate candidate paths so we can still compute
+                        // the minimum travel-time arrival per station in the next WITH clause.
+                        uniqueness: 'NODE_PATH',
+                        filterStartNode: true,
+                        // Guardrail for dense graph seeds: enough headroom for valid results
+                        // without allowing unbounded path explosion.
+                        limit: 500
+                    }}) YIELD path
+                    WHERE {_path_is_open_expr('path')}
+                    WITH last(nodes(path)) AS reached,
+                         reduce(total = 0.0, rel IN relationships(path) |
+                            total + coalesce(rel.route_time_weight, rel.travel_time_min, rel.transfer_time_min, 1.0)
+                         ) AS total_time_min,
+                         length(path) AS hops
+                    WHERE total_time_min <= $max_time_min
+                    WITH reached.station_id AS station_id,
+                         reached.name AS name,
+                        // Keep the best-known arrival time when the same station is
+                        // reachable through multiple path variants.
+                         round(min(total_time_min), 2) AS total_time_min,
+                         min(hops) AS hops_away,
+                         head(collect(coalesce(reached.lines, []))) AS lines
+                    RETURN station_id,
+                           name,
+                           total_time_min,
+                           hops_away,
+                           coalesce(lines, []) AS lines
+                    ORDER BY total_time_min ASC, hops_away ASC, station_id ASC
+                    """,
+                    {"origin_id": origin_id, "max_time_min": max_time_min},
+                )
+                return [dict(r) for r in records]
+            except (ServiceUnavailable, SessionExpired, Neo4jError):
+                # Match the non-throwing contract used by other query_ helpers.
                 return []
 
 

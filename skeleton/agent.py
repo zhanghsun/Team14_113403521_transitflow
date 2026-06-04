@@ -1,3 +1,4 @@
+# TASK 6 EXTENSION: Agent tool exposure for graph reachability analysis.
 """
 TransitFlow — Intelligent Agent
 ================================
@@ -54,6 +55,7 @@ from databases.graph.queries import (
     query_alternative_routes,
     query_interchange_path,
     query_delay_ripple,
+    query_reachable_stations,
 )
 
 
@@ -272,6 +274,15 @@ TOOLS = [
         },
         "required": ["station_id"],
     },
+    {
+        "name": "get_reachable_stations",
+        "description": "List every station reachable from an origin within a travel-time budget across metro and rail.",
+        "parameters": {
+            "origin_id":    {"type": "string", "description": "Station ID e.g. MS01 or NR01"},
+            "max_time_min": {"type": "integer", "description": "Maximum cumulative travel time in minutes"},
+        },
+        "required": ["origin_id"],
+    },
 ]
 
 TOOLS_SCHEMA = """\
@@ -286,7 +297,8 @@ cancel_booking(booking_id)
 get_user_bookings()
 search_policy(query)
 find_alternative_routes(origin_id, destination_id, avoid_station_id, network?)
-get_delay_ripple(station_id, hops?)"""
+get_delay_ripple(station_id, hops?)
+get_reachable_stations(origin_id, max_time_min?)"""
 
 
 # ── Agent logic ───────────────────────────────────────────────────────────────
@@ -439,6 +451,15 @@ def _execute_tool(
             result = query_delay_ripple(
                 delayed_station_id=params["station_id"],
                 hops=params.get("hops", 2),
+            )
+
+        elif tool_name == "get_reachable_stations":
+            # Expose the traversal result directly so the LLM can explain reachable stations without re-deriving them.
+            result = query_reachable_stations(
+                origin_id=params["origin_id"],
+                # Keep a deterministic default budget so tool invocation still works
+                # when users ask a vague question without an explicit minute value.
+                max_time_min=params.get("max_time_min", 30),
             )
 
         else:
@@ -697,6 +718,18 @@ JSON:"""
         if any(kw in _lower for kw in _personal_triggers):
             _fallback("get_user_bookings", {}, "personal booking query")
 
+    # 4. Reachability queries (Task 6) — look for reachability phrases + station ID
+    if not tool_calls:
+        _reach_triggers = ["reachable", "can i reach", "can reach", "reach from", "stations within", "stations i can reach"]
+        has_reach_kw = any(kw in _lower for kw in _reach_triggers) or re.search(r'within \d+ minute', _lower)
+        if has_reach_kw and _station_ids:
+            origin = _station_ids[0].upper()
+            m = re.search(r'within\s*(\d{1,3})', _lower)
+            # Use 30 as a safe, explainable baseline window when users omit time budget,
+            # so reachability still returns meaningful data instead of no-op routing.
+            minutes = int(m.group(1)) if m else 30
+            _fallback("get_reachable_stations", {"origin_id": origin, "max_time_min": minutes}, "reachability query")
+
     # Step 2: Execute each tool call against the real databases
     tool_results = []
     for call in tool_calls:
@@ -735,6 +768,30 @@ JSON:"""
     _DB_KEYWORDS = {"booking", "ticket", "schedule", "fare", "route", "seat",
                     "train", "metro", "journey", "trip", "history", "reservation"}
     if tool_results:
+        # Normalize specific tool outputs before handing them to the LLM for final composition.
+        for tr in tool_results:
+            if tr.get("tool") == "get_reachable_stations":
+                try:
+                    parsed = json.loads(tr.get("result") or "null")
+                except Exception:
+                    parsed = None
+                if isinstance(parsed, list):
+                    transformed = []
+                    for it in parsed:
+                        sid = it.get("station_id") or it.get("stationId")
+                        name = it.get("name") or it.get("station_name") or it.get("stationName")
+                        t = it.get("total_time_min") or it.get("total_time")
+                        try:
+                            tval = round(float(t), 2) if t is not None else None
+                        except Exception:
+                            tval = None
+                        # Normalise key names so final-answer prompting stays stable even
+                        # if underlying graph query field names evolve in later branches.
+                        transformed.append({"station_id": sid, "station_name": name, "total_time_min": tval})
+                    # Sort by travel time ascending (None values go last)
+                    transformed.sort(key=lambda x: (x["total_time_min"] is None, x["total_time_min"]))
+                    tr["result"] = json.dumps(transformed, ensure_ascii=False)
+
         data_block = "\n\n".join(
             f"[{tr['tool']}]\n{_normalise_result(tr['tool'], tr['result'])}"
             for tr in tool_results

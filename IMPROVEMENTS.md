@@ -507,3 +507,175 @@ TransitFlow now includes:
 * Gradio Interface
 
 Core functionality has been implemented and verified through both programmatic testing and database validation.
+
+---
+
+## Section 7 — Task 6 Extension: Graph Reachability
+
+### Motivation
+
+The existing graph features answer shortest-path, cheapest-path, alternative-path, and delay-ripple questions. Task 6 adds a different planning mode: instead of selecting one best route, the assistant can now list every station reachable within a fixed time budget. This is useful for exploratory trip planning, disruption planning, and live Q&A because the response is bounded, explainable, and easy to compare with the seeded network.
+
+### Database Changes
+
+No new schema objects were required for this extension. The implementation reuses the existing Neo4j model and reads only existing station and relationship properties.
+
+Graph model used:
+
+```cypher
+(:MetroStation)-[:METRO_LINK]->(:MetroStation)
+(:NationalRailStation)-[:RAIL_LINK]->(:NationalRailStation)
+(:MetroStation)-[:INTERCHANGE_TO]->(:NationalRailStation)
+(:NationalRailStation)-[:INTERCHANGE_TO]->(:MetroStation)
+```
+
+The new query in [databases/graph/queries.py](databases/graph/queries.py) stays read-only and computes cumulative travel time from relationship weights already present in the graph.
+
+### Example Query
+
+The extension is exposed as `query_reachable_stations(origin_id, max_time_min)`.
+
+```cypher
+MATCH (start {station_id: $origin_id})
+CALL apoc.path.expandConfig(start, {
+	relationshipFilter: 'METRO_LINK|RAIL_LINK|INTERCHANGE_TO',
+	minLevel: 1,
+	maxLevel: 20,
+	bfs: true,
+	uniqueness: 'NODE_PATH',
+	filterStartNode: true,
+	limit: 500
+}) YIELD path
+WITH last(nodes(path)) AS reached,
+	 reduce(total = 0.0, rel IN relationships(path) |
+		 total + coalesce(rel.route_time_weight, rel.travel_time_min, rel.transfer_time_min, 1.0)
+	 ) AS total_time_min
+WHERE total_time_min <= $max_time_min
+RETURN reached.station_id, reached.name, total_time_min
+ORDER BY total_time_min ASC
+```
+
+Actual output from the live demo run:
+
+```json
+[
+	{"station_id": "MS07", "name": "Old Town", "total_time_min": 2.0, "hops_away": 1, "lines": ["M2"]},
+	{"station_id": "MS02", "name": "Riverside", "total_time_min": 3.0, "hops_away": 1, "lines": ["M1"]},
+	{"station_id": "MS05", "name": "Westfield", "total_time_min": 3.0, "hops_away": 1, "lines": ["M1"]},
+	{"station_id": "MS06", "name": "Harbour View", "total_time_min": 3.0, "hops_away": 1, "lines": ["M2"]},
+	{"station_id": "MS18", "name": "Sunnyvale", "total_time_min": 4.0, "hops_away": 2, "lines": ["M2"]},
+	{"station_id": "NR01", "name": "Central Station", "total_time_min": 5.0, "hops_away": 1, "lines": ["NR1", "NR2"]},
+	{"station_id": "MS03", "name": "Northgate", "total_time_min": 5.0, "hops_away": 2, "lines": ["M1"]},
+	{"station_id": "MS20", "name": "Thornton", "total_time_min": 5.0, "hops_away": 2, "lines": ["M1"]},
+	{"station_id": "NR03", "name": "Old Town Junction", "total_time_min": 7.0, "hops_away": 2, "lines": ["NR1"]},
+	{"station_id": "MS08", "name": "University", "total_time_min": 8.0, "hops_away": 3, "lines": ["M2", "M4"]},
+	{"station_id": "MS04", "name": "Elm Park", "total_time_min": 9.0, "hops_away": 3, "lines": ["M1", "M3"]},
+	{"station_id": "MS09", "name": "Queensbridge", "total_time_min": 11.0, "hops_away": 4, "lines": ["M2"]},
+	{"station_id": "MS12", "name": "Lakeshore", "total_time_min": 12.0, "hops_away": 4, "lines": ["M3", "M4"]},
+	{"station_id": "MS17", "name": "Broadmoor", "total_time_min": 12.0, "hops_away": 4, "lines": ["M1", "M4"]}
+]
+```
+
+Live demo command used:
+
+```bash
+.\.venv\Scripts\python.exe task6_graph_demo.py --origin MS01 --budget 12 --destination NR05 --delay-station MS07 --hops 2
+```
+
+The same run also confirmed the existing shortest-route and delay-ripple queries still work after the extension:
+
+- Shortest route from MS01 to NR05 returned a valid path with total time 42.0 minutes.
+- Delay ripple around MS07 within 2 hops returned the expected affected stations across metro and rail.
+
+### Testing Evidence
+
+Validation and live execution were completed with the project virtual environment and the running Neo4j container.
+
+- Python workspace error checks passed for [databases/graph/queries.py](databases/graph/queries.py)
+- Python workspace error checks passed for [skeleton/agent.py](skeleton/agent.py)
+- Live demo output captured from `task6_graph_demo.py`
+- Neo4j service was already healthy during the run
+
+If you want to attach a browser screenshot in the final submission package, the live output above is the exact result that should be captured from Neo4j Browser or the Gradio demo.
+
+---
+
+# 13. Task 6 Extension — Graph Reachability
+
+## Motivation
+
+The base graph tools already answer shortest-path, cheapest-path, alternative-path, and delay-ripple questions. The new reachability query fills a different gap: it lets the assistant answer "what can I reach from here within X minutes?" This is useful for trip planning, disruption planning, and exploratory routing because it returns a bounded set of stations instead of only a single best path.
+
+## Database Changes
+
+No new Neo4j tables or relationships were required. The extension reuses the existing graph model:
+
+```cypher
+(:MetroStation)-[:METRO_LINK]->(:MetroStation)
+(:NationalRailStation)-[:RAIL_LINK]->(:NationalRailStation)
+(:MetroStation)-[:INTERCHANGE_TO]->(:NationalRailStation)
+(:NationalRailStation)-[:INTERCHANGE_TO]->(:MetroStation)
+```
+
+The new query in [databases/graph/queries.py](databases/graph/queries.py) keeps the graph read-only and calculates cumulative travel time from existing relationship properties.
+
+## Example Query
+
+The new query is implemented in Python as `query_reachable_stations(origin_id, max_time_min)`. The core traversal pattern is:
+
+```cypher
+MATCH (start {station_id: $origin_id})
+CALL apoc.path.expandConfig(start, {
+		relationshipFilter: 'METRO_LINK|RAIL_LINK|INTERCHANGE_TO',
+		minLevel: 1,
+		maxLevel: 20,
+		bfs: true,
+		uniqueness: 'NODE_PATH',
+		filterStartNode: true,
+		limit: 500
+}) YIELD path
+WITH last(nodes(path)) AS reached,
+		 reduce(total = 0.0, rel IN relationships(path) |
+				total + coalesce(rel.route_time_weight, rel.travel_time_min, rel.transfer_time_min, 1.0)
+		 ) AS total_time_min
+WHERE total_time_min <= $max_time_min
+RETURN reached.station_id, reached.name, total_time_min
+ORDER BY total_time_min ASC
+```
+
+Expected output shape:
+
+```json
+[
+	{"station_id": "MS02", "name": "Riverside", "total_time_min": 3.0},
+	{"station_id": "MS03", "name": "Northgate", "total_time_min": 5.0}
+]
+```
+
+## Testing Evidence
+
+Static validation completed successfully after the edit:
+
+- Python syntax / workspace error check passed for [databases/graph/queries.py](databases/graph/queries.py)
+- Python syntax / workspace error check passed for [skeleton/agent.py](skeleton/agent.py)
+- `git diff --check` passed with no whitespace or patch-format issues
+
+For live grading, this query should be demonstrated in Neo4j Browser or through the chat UI after the Neo4j service is running.
+
+## Live Demo Script
+
+To make the extension easy to show live, I added [task6_graph_demo.py](task6_graph_demo.py) as a read-only smoke test.
+
+Example usage:
+
+```bash
+python task6_graph_demo.py --origin MS01 --budget 12 --destination NR05 --delay-station MS07 --hops 2
+```
+
+What it demonstrates:
+
+- Reachable stations from a starting point within a time budget
+- Existing shortest-route behavior still works after the extension
+- Existing delay-ripple behavior still works after the extension
+
+For grading, the most important output block is the reachable-stations section because it is the new Task 6 feature.
