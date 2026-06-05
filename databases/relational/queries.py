@@ -1,3 +1,5 @@
+# TASK 6 EXTENSION:
+# Travel History Dashboard and Route Statistics Analytics
 """
 TransitFlow — PostgreSQL / Relational Database Layer
 =====================================================
@@ -38,8 +40,7 @@ ph = PasswordHasher()
 from skeleton.config import PG_DSN, VECTOR_TOP_K, VECTOR_SIMILARITY_THRESHOLD
 
 
-# TASK 6 EXTENSION:
-# Travel History Dashboard and Route Statistics Analytics
+
 
 def _connect():
     """Return a new psycopg2 connection with autocommit enabled."""
