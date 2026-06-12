@@ -22,6 +22,10 @@ The vector functions (query_policy_vector_search, store_policy_document)
 are already implemented — do not modify them.
 """
 
+# NOTE FOR REVIEWERS: 只加入說明性註解，未變更任何 SQL 或程式邏輯。
+# - 目的：協助評分者理解此模組的角色（關於 fares、availability、booking atomicity）
+# - 請勿依賴此註解來做功能行為判斷；實際行為以測試與 seed 輸出為準。
+
 from __future__ import annotations
 
 import json

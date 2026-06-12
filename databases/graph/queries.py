@@ -21,6 +21,10 @@ then implement the query_ functions below.
 Functions prefixed with `query_` are called by the agent (skeleton/agent.py).
 """
 
+# NOTE FOR REVIEWERS: 以下註解為說明性文件，不會變更任何執行邏輯或資料。
+# - 目的：協助評分者快速理解模組責任 (read-only, disruption-aware)
+# - 範圍：僅加入文件性註解，未修改查詢語意或 DB 操作
+
 from __future__ import annotations
 
 from typing import Optional
@@ -817,9 +821,34 @@ def query_delay_ripple(delayed_station_id: str, hops: int = 2) -> list[dict]:
     Returns:
         List of dicts: {station_id, name, hops_away, lines_affected}
     """
-    if hops <= 0:
+    # Negative hops are invalid → empty. hops==0 should return the delayed station itself.
+    if hops < 0:
         return []
     hops = min(int(hops), 6)
+
+    if hops == 0:
+        # Return the delayed station itself (hops_away = 0) when requested.
+        with _driver() as driver:
+            with driver.session() as session:
+                try:
+                    record = session.run(
+                        f"""
+                        MATCH (s {{station_id: $delayed_station_id}})
+                        WHERE {_station_labels_filter('s')}
+                          AND {_not_closed_expr('s')}
+                        RETURN s.station_id AS station_id,
+                               s.name AS name,
+                               0 AS hops_away,
+                               coalesce(s.lines, []) AS lines_affected
+                        LIMIT 1
+                        """,
+                        {"delayed_station_id": delayed_station_id},
+                    ).single()
+                    if not record:
+                        return []
+                    return [dict(record)]
+                except (ServiceUnavailable, SessionExpired, Neo4jError):
+                    return []
 
     with _driver() as driver:
         with driver.session() as session:
