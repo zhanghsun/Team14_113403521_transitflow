@@ -215,6 +215,18 @@ def _path_to_station_dicts(path) -> list[dict]:
     ]
 
 
+def _path_to_station_ids(path) -> list[str]:
+    """Compact path view for callers that only need station ordering."""
+    return [node.get("station_id") for node in path.nodes]
+
+
+def _legs_to_station_ids(legs: list[dict]) -> list[str]:
+    """Reconstruct station ordering from leg dictionaries without requerying Neo4j."""
+    if not legs:
+        return []
+    return [legs[0]["from_station_id"]] + [leg["to_station_id"] for leg in legs]
+
+
 def _path_to_leg_dicts(path) -> list[dict]:
     legs: list[dict] = []
     for idx, rel in enumerate(path.relationships):
@@ -368,6 +380,7 @@ def query_shortest_route(
         "found": True,
         "origin_id": origin_id,
         "destination_id": destination_id,
+        "path": _path_to_station_ids(route_path),
         "total_time_min": round(record["weight"], 2) if record["weight"] is not None else None,
         "total_fare_usd": None,
         "stations": stations,
@@ -535,6 +548,7 @@ def query_cheapest_route(
         "origin_id": origin_id,
         "destination_id": destination_id,
         "fare_class": fare_class,
+        "path": _path_to_station_ids(route_path),
         "total_time_min": round(float(total_time), 2),
         "total_fare_usd": round(float(total_fare), 2),
         "stations": stations,
@@ -653,6 +667,7 @@ def query_alternative_routes(
         "origin_id": origin_id,
         "destination_id": destination_id,
         "avoided_station_id": avoid_station_id,
+        "path": [_legs_to_station_ids(route) for route in routes],
         "routes": routes,
         "route_count": len(routes),
     }
@@ -772,6 +787,7 @@ def query_interchange_path(origin_id: str, destination_id: str) -> dict:
         "found": True,
         "origin_id": origin_id,
         "destination_id": destination_id,
+        "path": _path_to_station_ids(route_path),
         "total_time_min": round(record["weight"], 2) if record["weight"] is not None else None,
         "total_fare_usd": None,
         "stations": stations,
